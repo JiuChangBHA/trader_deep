@@ -67,7 +67,37 @@ class BacktestDataHandler(DataHandler):
         self.data_path = data_path
         self.data = self._load_data()
         self.current_idx = 0
+
+    def precompute_indicators(self, symbol: str, indicators: dict):
+        """Precompute technical indicators for a symbol's data"""
+        if symbol not in self.data:
+            return
+            
+        df = self.data[symbol].copy()
         
+        # Moving Averages
+        for window in indicators.get('moving_averages', []):
+            df[f'MA_{window}'] = df['Close'].rolling(window=window).mean()
+        
+        # RSI
+        for period in indicators.get('rsi_periods', []):
+            delta = df['Close'].diff()
+            gain = delta.where(delta > 0, 0)
+            loss = -delta.where(delta < 0, 0)
+            avg_gain = gain.rolling(period).mean()
+            avg_loss = loss.rolling(period).mean()
+            rs = avg_gain / avg_loss
+            df[f'RSI_{period}'] = 100 - (100 / (1 + rs))
+        
+        # Bollinger Bands
+        for window in indicators.get('bollinger_windows', []):
+            ma = df['Close'].rolling(window).mean()
+            std = df['Close'].rolling(window).std()
+            df[f'BB_Upper_{window}'] = ma + 2*std
+            df[f'BB_Lower_{window}'] = ma - 2*std
+            
+        self.data[symbol] = df
+
     def _load_data(self) -> Dict[str, pd.DataFrame]:
         data = {}
         try:
@@ -191,9 +221,9 @@ class MovingAverageCrossoverStrategy(TradingStrategy):
         
         # Create a proper copy of the DataFrame to avoid SettingWithCopyWarning
         data_copy = data.copy()
-        data_copy['Short_MA'] = data_copy['Close'].rolling(window=short_window, min_periods=1).mean()
-        data_copy['Long_MA'] = data_copy['Close'].rolling(window=long_window, min_periods=1).mean()
-        
+        data_copy['Short_MA'] = data_copy[f'MA_{short_window}']
+        data_copy['Long_MA'] = data_copy[f'MA_{long_window}']
+
         if data_copy['Short_MA'].iloc[-1] > data_copy['Long_MA'].iloc[-1] and data_copy['Short_MA'].iloc[-2] <= data_copy['Long_MA'].iloc[-2]:
             return {'action': 'BUY', 'strength': 1.0}
         elif data_copy['Short_MA'].iloc[-1] < data_copy['Long_MA'].iloc[-1] and data_copy['Short_MA'].iloc[-2] >= data_copy['Long_MA'].iloc[-2]:
@@ -211,17 +241,12 @@ class RSIStrategy(TradingStrategy):
         
         # Create a proper copy of the DataFrame to avoid SettingWithCopyWarning
         data_copy = data.copy()
-        delta = data_copy['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rsi = data_copy[f'RSI_{period}'].iloc[-1]
         
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        
-        if rsi.iloc[-1] < oversold:
-            return {'action': 'BUY', 'strength': (oversold - rsi.iloc[-1]) / oversold}
-        elif rsi.iloc[-1] > overbought:
-            return {'action': 'SELL', 'strength': (rsi.iloc[-1] - overbought) / (100 - overbought)}
+        if rsi < oversold:
+            return {'action': 'BUY', 'strength': (oversold - rsi) / oversold}
+        elif rsi > overbought:
+            return {'action': 'SELL', 'strength': (rsi - overbought) / (100 - overbought)}
         return {'action': 'HOLD', 'strength': 0}
     
 class MeanReversionStrategy(TradingStrategy):
@@ -391,7 +416,6 @@ class Portfolio:
 class TradingEngine:
     def __init__(self, config: dict):
         self.mode = config['mode']
-
         if self.mode == TradingMode.LIVE:
             self.data_handler = AlpacaDataHandler(config['api_key'], config['secret_key'])
             self.trading_client = TradingClient(config['api_key'], config['secret_key'])
@@ -408,21 +432,85 @@ class TradingEngine:
         self.mvo_enabled = config.get('mvo_enabled', True)
         self.rebalance_frequency = config.get('rebalance_frequency', 30)
         self.mvo_lookback = config.get('mvo_lookback', 252)
+        self._precompute_indicators() 
 
         # Walk-forward optimization parameters
         wf_config = config.get('walk_forward', {})
         self.optimization_window_days = wf_config.get('optimization_window_days', 180)
         self.out_of_sample_window_days = wf_config.get('out_of_sample_window_days', 30)
         self.last_optimization_day = -self.optimization_window_days
+
+    def _precompute_indicators(self):
+        """Precompute indicators based on optimized parameters from JSON"""
+        # Load optimized parameters
+        with open("optimized_params.json") as f:
+            optimized_params = json.load(f)["params"]
         
+        indicator_config = defaultdict(lambda: {
+            'moving_averages': set(),
+            'rsi_periods': set(),
+            'bollinger_windows': set(),
+            'meanreversion_windows': set()
+        })
+
+        # Parse parameters from JSON structure
+        for strategy_key, params in optimized_params.items():
+            # Convert string key to tuple ("('AAPL', 'Strategy')" -> ("AAPL", "Strategy"))
+            symbol, strategy_name = map(str.strip, strategy_key.strip("()").split(",", 1))
+            symbol = symbol.strip("'")
+            strategy_name = strategy_name.strip(" '")  # Handle quotes in strategy names
+
+            # Collect parameters for each strategy type
+            if "MovingAverageCrossover" in strategy_name:
+                indicator_config[symbol]['moving_averages'].add(params['short_window'])
+                indicator_config[symbol]['moving_averages'].add(params['long_window'])
+            elif "RSIStrategy" in strategy_name:
+                indicator_config[symbol]['rsi_periods'].add(params['period'])
+            elif "BollingerBandsStrategy" in strategy_name:
+                indicator_config[symbol]['bollinger_windows'].add(params['lookback'])
+            elif "MeanReversionStrategy" in strategy_name:
+                indicator_config[symbol]['meanreversion_windows'].add(params['lookback'])
+
+        # Precompute indicators for each symbol
+        for symbol in self.symbols:
+            config = indicator_config[symbol]
+            
+            # Get all unique windows needed for MA calculations
+            ma_windows = set()
+            ma_windows.update(config['moving_averages'])
+            ma_windows.update(config['bollinger_windows'])
+            ma_windows.update(config['meanreversion_windows'])
+            
+            # Precompute indicators
+            df = self.data_handler.data[symbol].copy()
+            
+            # Moving Averages
+            for window in ma_windows:
+                df[f'MA_{window}'] = df['Close'].rolling(window).mean()
+            
+            # Standard Deviations (for Bollinger Bands and Mean Reversion)
+            for window in config['bollinger_windows'].union(config['meanreversion_windows']):
+                df[f'Std_{window}'] = df['Close'].rolling(window).std()
+            
+            # RSI
+            for period in config['rsi_periods']:
+                delta = df['Close'].diff()
+                gain = delta.where(delta > 0, 0)
+                loss = -delta.where(delta < 0, 0)
+                avg_gain = gain.rolling(period).mean()
+                avg_loss = loss.rolling(period).mean()
+                rs = avg_gain / avg_loss
+                df[f'RSI_{period}'] = 100 - (100 / (1 + rs))
+            
+            # Update data with precomputed indicators
+            self.data_handler.data[symbol] = df
+            
     def _init_strategies(self, strategy_config: dict) -> Dict[str, List[TradingStrategy]]:
-        """Initialize all trading strategies for each symbol"""
         strategies = {}
         
         # Handle empty strategy config
         if not strategy_config or isinstance(strategy_config, dict) and not strategy_config:
-            logger.info("No strategy config provided, using all available strategies with default parameters")
-            # Initialize with all available strategies for each symbol
+            # Initialize with default strategies
             for symbol in self.symbols:
                 strategies[symbol] = [
                     StrategyFactory.create_strategy(name, symbol, {})
@@ -432,7 +520,6 @@ class TradingEngine:
             
         # Handle case where strategy_config is the StrategyFactory.strategies dictionary
         if strategy_config == StrategyFactory.strategies:
-            logger.info("Using all available strategy types for each symbol")
             for symbol in self.symbols:
                 strategies[symbol] = [
                     StrategyFactory.create_strategy(name, symbol, {})
@@ -451,15 +538,6 @@ class TradingEngine:
                     strategies[symbol].append(
                         StrategyFactory.create_strategy(strategy_name, symbol, params)
                     )
-        
-        # Check if any symbol has no strategies and add default strategies
-        for symbol in self.symbols:
-            if symbol not in strategies or not strategies[symbol]:
-                logger.info(f"No strategies defined for {symbol}, using all available strategies with default parameters")
-                strategies[symbol] = [
-                    StrategyFactory.create_strategy(name, symbol, {})
-                    for name in StrategyFactory.strategies
-                ]
                     
         return strategies
 
@@ -766,31 +844,20 @@ class TradingEngine:
         return action_map[signal['action']] * signal.get('strength', 0)
 
     def _find_optimal_weights(self, strategy_signals: List[List[float]], data: pd.DataFrame) -> List[float]:
-        """Find optimal weights for multiple strategies to maximize Sharpe ratio"""
+        """Grid search to find weights maximizing Sharpe ratio"""
         best_sharpe = -np.inf
-        n_strategies = len(strategy_signals)
+        best_weights = [1/len(strategy_signals)] * len(strategy_signals)  # Default equal weights
         
-        # Default to equal weights
-        best_weights = [1.0 / n_strategies] * n_strategies  
-        
-        # Handle special case of single strategy
-        if n_strategies == 1:
-            return [1.0]
-            
-        # Handle case of two strategies with grid search (efficient)
-        if n_strategies == 2:
+        # Generate all possible weight combinations for two strategies
+        if len(strategy_signals) == 2:
             closes = data['Close'].values
             returns = np.diff(closes) / closes[:-1] if len(closes) > 1 else []
             
             for w1 in np.linspace(0, 1, 21):  # 0.0, 0.05, ..., 1.0
                 w2 = 1 - w1
-                weights = [w1, w2]
-                
                 combined = []
-                for i in range(len(strategy_signals[0][:-1])):
-                    # Weighted sum of signals
-                    combined_signal = sum(w * strategy_signals[j][i] for j, w in enumerate(weights))
-                    combined.append(combined_signal)
+                for s1, s2 in zip(strategy_signals[0][:-1], strategy_signals[1][:-1]):
+                    combined.append(w1*s1 + w2*s2)
                 
                 if len(returns) == 0 or len(combined) == 0:
                     continue
@@ -800,52 +867,7 @@ class TradingEngine:
                 
                 if sharpe > best_sharpe:
                     best_sharpe = sharpe
-                    best_weights = weights
-        
-        # For 3 or more strategies, use a simplified approach (slower but general)
-        elif n_strategies >= 3:
-            closes = data['Close'].values
-            returns = np.diff(closes) / closes[:-1] if len(closes) > 1 else []
-            
-            if len(returns) == 0:
-                return best_weights
-                
-            # Test a limited set of weight combinations
-            # For 3+ strategies, we'll try some pre-defined weight distributions
-            weight_combinations = []
-            
-            # Equal weights
-            weight_combinations.append([1.0/n_strategies] * n_strategies)
-            
-            # Single dominant strategy with equal remainder
-            for i in range(n_strategies):
-                weights = [0.1/(n_strategies-1)] * n_strategies
-                weights[i] = 0.9
-                weight_combinations.append(weights)
-            
-            # Pairs of strategies (if we have more than 3)
-            if n_strategies > 3:
-                for i in range(n_strategies):
-                    for j in range(i+1, n_strategies):
-                        weights = [0.05/(n_strategies-2)] * n_strategies
-                        weights[i] = 0.475
-                        weights[j] = 0.475
-                        weight_combinations.append(weights)
-            
-            # Evaluate each weight combination
-            for weights in weight_combinations:
-                combined = []
-                for i in range(len(strategy_signals[0][:-1])):
-                    # Weighted sum of signals
-                    combined_signal = sum(w * strategy_signals[j][i] for j, w in enumerate(weights) if i < len(strategy_signals[j]))
-                    combined.append(combined_signal)
-                
-                strategy_returns = [c*r for c, r in zip(combined, returns)]
-                sharpe = self._calculate_sharpe(strategy_returns)
-                
-                if sharpe > best_sharpe:
-                    best_sharpe = sharpe
-                    best_weights = weights
+                    best_weights = [w1, w2]
         
         return best_weights
 
@@ -902,45 +924,31 @@ class StrategyOptimizer:
 
         # Collect all tasks
         tasks = []
+        # Limit to just one symbol for faster testing
+        sample_symbol = self.engine.symbols[0] if self.engine.symbols else None
         
-        # Process all symbols with all strategies for each symbol
-        for symbol in self.engine.symbols:
-            if symbol in self.engine.strategies:
-                strategies = self.engine.strategies[symbol]
-                # Use all strategies for each symbol
-                for strategy in strategies:
+        if sample_symbol:
+            # Just get strategies for one symbol instead of all
+            if sample_symbol in self.engine.strategies:
+                strategies = self.engine.strategies[sample_symbol]
+                # Further limit to at most 2 strategies for quick testing
+                for strategy in strategies[:min(2, len(strategies))]:
                     strategy_name = strategy.__class__.__name__
-                    tasks.append((symbol, strategy, strategy_name))
+                    tasks.append((sample_symbol, strategy, strategy_name))
         
         # Use a simpler progress indicator instead of tqdm
         total_tasks = len(tasks)
-        logger.info(f"Optimizing {total_tasks} strategy/symbol combinations...")
+        logger.info(f"Quick testing: Optimizing {total_tasks} strategy/symbol combinations...")
         
-        # Disable most logging during optimization to reduce noise
-        optuna_logger = logging.getLogger("optuna")
-        original_level = optuna_logger.level
-        optuna_logger.setLevel(logging.ERROR)  # Only show errors during optimization
-        
-        try:
-            for i, (symbol, strategy, strategy_name) in enumerate(tasks, 1):
-                # Log progress at reasonable intervals
-                if i % max(1, total_tasks // 5) == 0 or i == 1:
-                    logger.info(f"Optimizing {symbol} {strategy_name} ({i}/{total_tasks})")
-                
-                # Run each optimization sequentially for stability
-                (symbol_result, strategy_name_result), params = self.optimize_strategy(symbol, strategy, strategy_name)
-                self.optimization_results[(symbol_result, strategy_name_result)] = params
-                
-                # Log progress on completion
-                if i % max(1, total_tasks // 5) == 0 or i == total_tasks:
-                    progress_pct = i / total_tasks * 100
-                    logger.info(f"Optimization progress: {i}/{total_tasks} ({progress_pct:.1f}% complete)")
-        finally:
-            # Restore original logging level
-            optuna_logger.setLevel(original_level)
+        for i, (symbol, strategy, strategy_name) in enumerate(tasks, 1):
+            # Run each optimization sequentially for stability
+            (symbol_result, strategy_name_result), params = self.optimize_strategy(symbol, strategy, strategy_name)
+            self.optimization_results[(symbol_result, strategy_name_result)] = params
+            # Log progress every 25% completion
+            if i % max(1, total_tasks // 4) == 0 or i == total_tasks:
+                logger.info(f"Optimization progress: {i}/{total_tasks} ({i/total_tasks:.0%} complete)")
             
         self._save_results_to_cache()
-        logger.info(f"Optimization completed for {total_tasks} strategy/symbol combinations and results cached")
 
     def _save_results_to_cache(self):
         """Save optimized parameters to JSON file"""
@@ -979,85 +987,41 @@ class StrategyOptimizer:
         
     def optimize_strategy(self, symbol: str, strategy: TradingStrategy, strategy_name: str = None):
         """Optimize parameters for a single strategy/symbol combination"""
+        study = optuna.create_study(direction='maximize')
+        
         # If strategy_name not provided, derive it from the class
         if strategy_name is None:
             strategy_name = strategy.__class__.__name__
             
-        # Use fixed number of trials for consistency and speed
-        n_trials = 5  # Small number of trials for quick optimization
-        
-        # Create study with pruner to stop unpromising trials early
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=2)
-        study = optuna.create_study(
-            direction='maximize',
-            pruner=pruner
-        )
-        
         study.optimize(
             lambda trial: self._objective(trial, symbol, strategy),
-            n_trials=n_trials,
+            n_trials=config['optimization']['n_trials'],
             n_jobs=1,
             show_progress_bar=False  # Disable progress bar
         )
         
-        # Return best params or default params if optimization failed
-        if study.best_params:
-            return (symbol, strategy_name), study.best_params
-        
-        # Fallback to default parameters if optimization failed
-        default_params = self._get_default_params(strategy)
-        logger.warning(f"Optimization failed for {symbol} {strategy_name}, using default parameters")
-        return (symbol, strategy_name), default_params
-        
-    def _get_default_params(self, strategy: TradingStrategy):
-        """Get default parameters for a strategy if optimization fails"""
-        if isinstance(strategy, MeanReversionStrategy):
-            return {'lookback': 20, 'threshold': 2.0}
-        elif isinstance(strategy, BollingerBandsStrategy):
-            return {'lookback': 20, 'num_std': 2.0}
-        elif isinstance(strategy, MovingAverageCrossoverStrategy):
-            return {'short_window': 10, 'long_window': 50}
-        elif isinstance(strategy, RSIStrategy):
-            return {'period': 14, 'overbought': 70, 'oversold': 30}
-        return {}
+        return (symbol, strategy_name), study.best_params
 
     def _objective(self, trial, symbol: str, strategy: TradingStrategy) -> float:
-        """Objective function for Optuna optimization - optimized for faster multi-symbol testing"""
+        """Objective function for Optuna optimization - simplified for faster testing"""
         # 1. Get historical data
         data = self.engine.data_handler.data[symbol]
         
         # Use a smaller subset of data for faster testing
-        if len(data) > 200:  # Only use a subset if we have enough data
-            data = data.iloc[-200:]
+        # if len(data) > 200:  # Only use a subset if we have enough data
+        #     data = data.iloc[-200:]
         
         # 2. Suggest parameters based on strategy type
         params = self._suggest_parameters(trial, strategy)
         
-        # 3. Configure walk-forward validation with minimal splits for speed
-        n_splits = 2  # Reduced from 3 for better speed with multi-symbol
-        tscv = TimeSeriesSplit(n_splits=n_splits)
+        # 3. Configure walk-forward validation with fewer splits
+        tscv = TimeSeriesSplit(n_splits=3)  # Reduced from 5 splits
         returns = []
         
-        # 4. Walk-forward validation - simplified for multi-symbol speed
+        # 4. Walk-forward validation
         for train_idx, test_idx in tscv.split(data):
-            # Use a smaller test set
-            test_start = test_idx[0]
-            test_end = test_idx[-1]
-            test_size = test_end - test_start + 1
-            
-            # Only test on a sample of the data if test set is large
-            if test_size > 50:
-                # Take points from start, middle and end of test set
-                test_indices = [
-                    test_start,
-                    test_start + test_size // 4,
-                    test_start + test_size // 2,
-                    test_start + (3 * test_size) // 4,
-                    test_end
-                ]
-                test_data = data.iloc[test_indices]
-            else:
-                test_data = data.iloc[test_idx]
+            train_data = data.iloc[train_idx]
+            test_data = data.iloc[test_idx]
             
             # Clone strategy with new parameters
             temp_strategy = strategy.__class__(symbol, params)
@@ -1088,29 +1052,16 @@ class StrategyOptimizer:
         return params
 
     def _backtest_strategy(self, strategy: TradingStrategy, data: pd.DataFrame) -> dict:
-        """Backtest a single strategy on given data (optimized for speed)"""
-        # Use a subset of data if it's too large
-        max_samples = 200  # Limit number of data points to process
-        if len(data) > max_samples:
-            # Use equally spaced samples throughout the data
-            step = len(data) // max_samples
-            indices = list(range(0, len(data), step))
-            if indices[-1] != len(data) - 1:  # Make sure to include the last point
-                indices.append(len(data) - 1)
-            data = data.iloc[indices]
-            
+        """Backtest a single strategy on given data"""
         # Calculate signals for this strategy
         signals = []
         for i in range(len(data)):
             try:
-                # Use a shorter history for signal calculation to improve speed
-                history_size = min(i+1, 50)  # Limit history to 50 data points
-                data_slice = data.iloc[i+1-history_size:i+1]
-                signal = strategy.calculate_signal(data_slice)
+                signal = strategy.calculate_signal(data.iloc[:i+1])
                 normalized = self._signal_to_numeric(signal)
                 signals.append(normalized)
             except Exception as e:
-                # Silently ignore errors during optimization
+                logger.error(f"Error calculating signal: {e}")
                 signals.append(0)
                 
         # Calculate returns based on signals
@@ -1123,12 +1074,25 @@ class StrategyOptimizer:
         # Calculate performance metrics
         if not returns:
             return {'sharpe': -999, 'max_drawdown': 0, 'returns': 0}
-        
-        # For speed, use simpler versions of key performance metrics
+            
         sharpe_ratio = np.mean(returns) / (np.std(returns) or 0.0001) * np.sqrt(252)
         
-        # Early exit with just the Sharpe ratio for optimization
-        return {'sharpe': sharpe_ratio}
+        # Calculate max drawdown
+        cumulative = np.cumprod(np.array(returns) + 1)
+        peak = np.maximum.accumulate(cumulative)
+        drawdown = (peak - cumulative) / peak
+        max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0
+        
+        # Calculate annualized returns
+        total_return = cumulative[-1] - 1 if len(cumulative) > 0 else 0
+        days = len(returns)
+        annualized_returns = ((1 + total_return) ** (252/days)) - 1 if days > 0 else 0
+        
+        return {
+            'sharpe': sharpe_ratio,
+            'max_drawdown': max_drawdown,
+            'returns': annualized_returns
+        }
 
     def _signal_to_numeric(self, signal: dict) -> float:
         """Convert signal dict to numeric value"""

@@ -320,4 +320,7 @@ if __name__ == "__main__":
     
     # Create and run dashboard
     dashboard = TradingDashboard(engine)
-    dashboard.app.run_server(debug=True)
+    
+    # You can change the port number below (default is 8050)
+    port = 9050  # Change this value to use a different port
+    dashboard.app.run_server(debug=True, port=port)
