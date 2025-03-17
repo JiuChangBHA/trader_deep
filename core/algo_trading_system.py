@@ -5,14 +5,23 @@ import logging
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
+import optuna
+from joblib import Parallel, delayed
+from sklearn.model_selection import TimeSeriesSplit
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any, Union, ForwardRef
+
+# Import in stages to avoid circular dependencies
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
+
+# Define forward references
+TradingEngine = ForwardRef('TradingEngine')
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -290,6 +299,155 @@ class SignalAggregator:
         scaled = signal / max(volatility, 0.01)
         return np.tanh(scaled)  # Squash to [-1, 1]
 
+# Modified TimeSeriesSplit for financial data
+class PurgedTimeSeriesSplit(TimeSeriesSplit):
+    """Version with gap to prevent information leakage"""
+    def __init__(self, n_splits=5, purge_gap=5):
+        super().__init__(n_splits)
+        self.purge_gap = purge_gap
+
+    def split(self, X):
+        splits = super().split(X)
+        for train_idx, test_idx in splits:
+            yield (train_idx[:-self.purge_gap], 
+                   test_idx[self.purge_gap:])
+            
+# Modified objective function for multiple metrics
+def _objective(self, trial, symbol: str, strategy: TradingStrategy):
+    # ...
+    return (
+        test_perf['sharpe'] * 0.7 +
+        test_perf['returns'] * 0.2 -
+        test_perf['max_drawdown'] * 0.1
+    )
+
+class StrategyOptimizer:
+    def __init__(self, engine: 'TradingEngine'):
+        self.engine = engine
+        self.optimization_results = {}
+
+    def optimize_all(self):
+        """Optimize parameters for all strategy/symbol combinations"""
+        tasks = []
+        for symbol, strategies in self.engine.strategies.items():
+            for strategy in strategies:
+                tasks.append((symbol, strategy))
+                
+        # Parallel optimization
+        results = Parallel(n_jobs=-1)(
+            delayed(self.optimize_strategy)(symbol, strategy)
+            for symbol, strategy in tasks
+        )
+        
+        # Store results
+        for (symbol, strategy_name), params in results:
+            self.optimization_results[(symbol, strategy_name)] = params
+
+    def optimize_strategy(self, symbol: str, strategy: TradingStrategy):
+        """Optimize parameters for a single strategy/symbol combination"""
+        study = optuna.create_study(direction='maximize')
+        study.optimize(
+            lambda trial: self._objective(trial, symbol, strategy),
+            n_trials=100,
+            n_jobs=1
+        )
+        return (symbol, strategy.__class__.__name__), study.best_params
+
+    def _objective(self, trial, symbol: str, strategy: TradingStrategy) -> float:
+        """Objective function for Optuna optimization"""
+        # 1. Get historical data
+        data = self.engine.data_handler.data[symbol]
+        
+        # 2. Suggest parameters based on strategy type
+        params = self._suggest_parameters(trial, strategy)
+        
+        # 3. Configure walk-forward validation
+        tscv = TimeSeriesSplit(n_splits=5)
+        returns = []
+        
+        # 4. Walk-forward validation
+        for train_idx, test_idx in tscv.split(data):
+            train_data = data.iloc[train_idx]
+            test_data = data.iloc[test_idx]
+            
+            # Clone strategy with new parameters
+            temp_strategy = strategy.__class__(symbol, params)
+            
+            # Train and test
+            train_perf = self._backtest_strategy(temp_strategy, train_data)
+            test_perf = self._backtest_strategy(temp_strategy, test_data)
+            
+            # Use test performance with penalty for overfitting
+            returns.append(test_perf['sharpe'] - abs(train_perf['sharpe'] - test_perf['sharpe']))
+            
+        return np.mean(returns)
+
+    def _suggest_parameters(self, trial, strategy: TradingStrategy):
+        """Parameter space definition"""
+        params = {}
+        if isinstance(strategy, MeanReversionStrategy):
+            params['lookback'] = trial.suggest_int('lookback', 10, 50)
+            params['threshold'] = trial.suggest_float('threshold', 1.0, 3.0)
+        elif isinstance(strategy, BollingerBandsStrategy):
+            params['lookback'] = trial.suggest_int('lookback', 10, 50)
+            params['num_std'] = trial.suggest_float('num_std', 1.5, 2.5)
+        elif isinstance(strategy, MovingAverageCrossoverStrategy):
+            params['short_window'] = trial.suggest_int('short_window', 5, 20)
+            params['long_window'] = trial.suggest_int('long_window', 30, 100)
+        elif isinstance(strategy, RSIStrategy):
+            params['period'] = trial.suggest_int('period', 10, 21)
+            params['overbought'] = trial.suggest_int('overbought', 65, 75)
+            params['oversold'] = trial.suggest_int('oversold', 25, 35)
+        return params
+
+    def _backtest_strategy(self, strategy: TradingStrategy, data: pd.DataFrame) -> dict:
+        """Backtest a single strategy on given data"""
+        # Calculate signals for this strategy
+        signals = []
+        for i in range(len(data)):
+            try:
+                signal = strategy.calculate_signal(data.iloc[:i+1])
+                normalized = self._signal_to_numeric(signal)
+                signals.append(normalized)
+            except Exception as e:
+                logger.error(f"Error calculating signal: {e}")
+                signals.append(0)
+                
+        # Calculate returns based on signals
+        returns = []
+        for i in range(1, len(data)):
+            price_change = (data['Close'].iloc[i] / data['Close'].iloc[i-1]) - 1
+            signal_return = signals[i-1] * price_change
+            returns.append(signal_return)
+            
+        # Calculate performance metrics
+        if not returns:
+            return {'sharpe': -999, 'max_drawdown': 0, 'returns': 0}
+            
+        sharpe_ratio = np.mean(returns) / (np.std(returns) or 0.0001) * np.sqrt(252)
+        
+        # Calculate max drawdown
+        cumulative = np.cumprod(np.array(returns) + 1)
+        peak = np.maximum.accumulate(cumulative)
+        drawdown = (peak - cumulative) / peak
+        max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0
+        
+        # Calculate annualized returns
+        total_return = cumulative[-1] - 1 if len(cumulative) > 0 else 0
+        days = len(returns)
+        annualized_returns = ((1 + total_return) ** (252/days)) - 1 if days > 0 else 0
+        
+        return {
+            'sharpe': sharpe_ratio,
+            'max_drawdown': max_drawdown,
+            'returns': annualized_returns
+        }
+
+    def _signal_to_numeric(self, signal: dict) -> float:
+        """Convert signal dict to numeric value"""
+        action_map = {'BUY': 1, 'SELL': -1, 'HOLD': 0}
+        return action_map[signal['action']] * signal.get('strength', 0)
+
 class Portfolio:
     def __init__(self, initial_cash: float = 100000):
         self.positions: Dict[str, float] = {}
@@ -491,6 +649,7 @@ class TradingEngine:
             # Walk-forward optimization check
             if (day >= self.optimization_window_days and 
                 (day - self.last_optimization_day) >= self.out_of_sample_window_days):
+                # self.optimizer.optimize_all()
                 window_start = day - self.optimization_window_days
                 window_end = day - 1
                 self._optimize_weights(window_start, window_end)
@@ -711,10 +870,24 @@ class TradingEngine:
 
 class Backtester:
     def __init__(self, config: dict):
-        self.engine = TradingEngine(config)
+        self.config = config
+        self.engine = None
+        self.optimizer = None
         self.results = {}
+        
+    def initialize(self):
+        # Use the local import without the core prefix
+        from algo_trading_system import TradingEngine
+        self.engine = TradingEngine(self.config)
+        self.optimizer = StrategyOptimizer(self.engine)
 
     async def run(self):
+        if not self.engine:
+            self.initialize()
+            
+        # Temporarily comment out optimization
+        # if self.engine.mode == TradingMode.BACKTEST:
+        #     self.optimizer.optimize_all()
         await self.engine.run()
         self._generate_performance_report()
         return self.engine
@@ -754,7 +927,7 @@ config = {
     'secret_key': 'mPWPeY6T2TfyiAv7ebrFDejhFa0yhH1Xlj57v0lb',
     'data_path': 'C:/Users/jchang427/OneDrive - Georgia Institute of Technology/Random Projects/trading_sim_cursor/src/main/resources/market_data/2025-03-10-07-28_market_data_export_2020-03-11_to_2025-03-10',  # Simplified path that will use synthetic data
     'initial_equity': 100000,
-    'symbols': ['AAPL', 'MSFT', 'NVDA'],
+    'symbols': ['AAPL', 'MSFT', 'NVDA', 'TSLA'],
     'strategies': {
         'AAPL': {
             'mean_reversion': {'lookback': 25, 'threshold': 2.5, 'weight': 0.9165/(0.9165+0.7755)},
@@ -765,6 +938,10 @@ config = {
             'bollinger_bands': {'lookback': 14, 'num_std': 2.25, 'weight': 1.0791/(1.0791+0.9301)}
         },
         'NVDA': {
+            'mean_reversion': {'lookback': 15, 'threshold': 1.25, 'weight': 0.9301/(1.0791+0.9301)},
+            'bollinger_bands': {'lookback': 14, 'num_std': 2.25, 'weight': 1.0791/(1.0791+0.9301)}
+        },
+        'TSLA': {
             'mean_reversion': {'lookback': 15, 'threshold': 1.25, 'weight': 0.9301/(1.0791+0.9301)},
             'bollinger_bands': {'lookback': 14, 'num_std': 2.25, 'weight': 1.0791/(1.0791+0.9301)}
         }
