@@ -135,6 +135,45 @@ class TradingStrategy(ABC):
     def calculate_signal(self, data: pd.DataFrame) -> dict:
         pass
 
+class MovingAverageCrossoverStrategy(TradingStrategy):
+    def calculate_signal(self, data: pd.DataFrame) -> dict:
+        short_window = self.params.get('short_window', 10)
+        long_window = self.params.get('long_window', 50)
+        
+        if len(data) < long_window:
+            return {'action': 'HOLD', 'strength': 0}
+        
+        data['Short_MA'] = data['Close'].rolling(window=short_window, min_periods=1).mean()
+        data['Long_MA'] = data['Close'].rolling(window=long_window, min_periods=1).mean()
+        
+        if data['Short_MA'].iloc[-1] > data['Long_MA'].iloc[-1] and data['Short_MA'].iloc[-2] <= data['Long_MA'].iloc[-2]:
+            return {'action': 'BUY', 'strength': 1.0}
+        elif data['Short_MA'].iloc[-1] < data['Long_MA'].iloc[-1] and data['Short_MA'].iloc[-2] >= data['Long_MA'].iloc[-2]:
+            return {'action': 'SELL', 'strength': 1.0}
+        return {'action': 'HOLD', 'strength': 0}
+
+class RSIStrategy(TradingStrategy):
+    def calculate_signal(self, data: pd.DataFrame) -> dict:
+        period = self.params.get('period', 14)
+        overbought = self.params.get('overbought', 70)
+        oversold = self.params.get('oversold', 30)
+        
+        if len(data) < period:
+            return {'action': 'HOLD', 'strength': 0}
+        
+        delta = data['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        if rsi.iloc[-1] < oversold:
+            return {'action': 'BUY', 'strength': (oversold - rsi.iloc[-1]) / oversold}
+        elif rsi.iloc[-1] > overbought:
+            return {'action': 'SELL', 'strength': (rsi.iloc[-1] - overbought) / (100 - overbought)}
+        return {'action': 'HOLD', 'strength': 0}
+    
 class MeanReversionStrategy(TradingStrategy):
     def calculate_signal(self, data: pd.DataFrame) -> dict:
         closes = data['Close'].values
@@ -180,6 +219,8 @@ class StrategyFactory:
     @staticmethod
     def create_strategy(name: str, symbol: str, params: dict) -> TradingStrategy:
         strategies = {
+            'moving_average_crossover': MovingAverageCrossoverStrategy,
+            'rsi': RSIStrategy,
             'mean_reversion': MeanReversionStrategy,
             'bollinger_bands': BollingerBandsStrategy
         }
@@ -214,11 +255,13 @@ class SignalAggregator:
             return None
 
         raw_signals = []
+        total_weight = sum(strategy.params.get('weight', 1.0) for strategy in self.strategies[symbol])
+
         for strategy in self.strategies[symbol]:
             try:
                 signal = strategy.calculate_signal(data)
                 normalized = self._normalize_signal(signal)
-                weighted = self._apply_strategy_weights(strategy, normalized)
+                weighted = self._apply_strategy_weights(strategy, normalized, total_weight)
                 raw_signals.append(weighted)
             except Exception as e:
                 logger.error(f"Signal error in {strategy.__class__.__name__}: {str(e)}")
@@ -234,8 +277,8 @@ class SignalAggregator:
         action_map = {'BUY': 1, 'SELL': -1, 'HOLD': 0}
         return action_map[signal['action']] * signal['strength']
 
-    def _apply_strategy_weights(self, strategy: TradingStrategy, signal: float) -> float:
-        return signal * strategy.params.get('weight', 1.0)
+    def _apply_strategy_weights(self, strategy: TradingStrategy, signal: float, total_weight: float) -> float:
+        return signal * strategy.params.get('weight', 1.0) / total_weight
 
     def _aggregate_signals(self, signals: List[float]) -> float:
         decay_factor = 0.95
