@@ -4,6 +4,7 @@ import asyncio
 import logging
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 from alpaca.data.historical import StockHistoricalDataClient
@@ -302,6 +303,9 @@ class TradingEngine:
         self.signal_aggregator = SignalAggregator(self.strategies, self.risk_manager)
         self.current_date = None
         self.current_day = 0
+        self.mvo_enabled = config.get('mvo_enabled', True)
+        self.rebalance_frequency = config.get('rebalance_frequency', 30)
+        self.mvo_lookback = config.get('mvo_lookback', 252)
 
         # Walk-forward optimization parameters
         wf_config = config.get('walk_forward', {})
@@ -352,10 +356,15 @@ class TradingEngine:
         except Exception as e:
             logger.error(f"Trading cycle error: {e}")
 
-    async def _execute_trade(self, symbol: str, signal: float, price: float):
+    async def _execute_trade(self, symbol: str, signal: float, price: float, override_qty: float = None):
         
+        if override_qty is not None:
+            position_size = override_qty
+        else:
+            self.risk_manager.current_equity = self.portfolio.value()
+            position_size = self.risk_manager.calculate_position_size(symbol, price)
         position_size = self.risk_manager.calculate_position_size(symbol, price)
-        amount = signal * position_size
+        amount = signal * (position_size if override_qty is None else override_qty)
         current_amount = self.portfolio.positions.get(symbol, 0)
         if amount < 0:
             amount = max(amount, -current_amount)
@@ -396,6 +405,19 @@ class TradingEngine:
             self.portfolio._update_portfolio(symbol, amount, price, self.current_date, self.current_day)
             # logger.info(f"Date: {self.current_date.strftime('%Y-%m-%d')}, Day: {self.current_day}, Executed {amount:.2f} shares of {symbol} @ {price:.2f}")
 
+    async def _rebalance_with_mvo(self):
+        """Main MVO rebalancing routine"""
+        logger.info(f"Performing MVO rebalancing on day {self.current_day}")
+        
+        # Get optimal weights
+        optimal_weights = self._calculate_mvo_weights()
+        if not optimal_weights:
+            logger.warning("MVO optimization failed, skipping rebalance")
+            return
+            
+        # Execute rebalancing trades
+        await self._execute_mvo_rebalance(optimal_weights)
+        
     async def _run_backtest(self):
         handler = self.data_handler
         
@@ -420,6 +442,9 @@ class TradingEngine:
             self.current_day = day
             self.current_date = self.backtest_dates[day]
             handler.current_idx = day
+            # MVO Rebalancing
+            if self.mvo_enabled and day % self.rebalance_frequency == 0 and day != 0:
+                await self._rebalance_with_mvo()
             # Walk-forward optimization check
             if (day >= self.optimization_window_days and 
                 (day - self.last_optimization_day) >= self.out_of_sample_window_days):
@@ -441,7 +466,6 @@ class TradingEngine:
             self.backtest_results.append(self.portfolio.value())
             # logger.info(f"Date: {current_date.strftime('%Y-%m-%d')}, Day: {day}: Portfolio Value {self.backtest_results[-1]:.2f}")
         
-        logger.info(f"Backtest complete. Total trades: {len(self.portfolio.trade_history)}")
         # Prepare data for the dashboard
         self.backtest_data = {
             'history': self.portfolio.historical_states,
@@ -458,6 +482,103 @@ class TradingEngine:
                 for t in self.portfolio.trade_history
             ]
         }
+
+
+    def _calculate_mvo_weights(self):
+        """Calculate optimal portfolio weights using MVO"""
+        try:
+            # Collect historical returns for all symbols
+            returns_data = {}
+            for symbol in self.symbols:
+                data = self.data_handler.data[symbol]
+                start_idx = max(0, self.current_day - self.mvo_lookback)
+                closes = data['Close'].iloc[start_idx:self.current_day]
+                returns = closes.pct_change().dropna()
+                returns_data[symbol] = returns
+                
+            returns_df = pd.DataFrame(returns_data).dropna()
+            
+            if returns_df.empty:
+                logger.warning("Not enough data for MVO calculation")
+                return None
+
+
+            # Calculate expected returns and covariance matrix
+            expected_returns = returns_df.mean()
+            cov_matrix = returns_df.cov()
+            
+            # Optimization setup
+            n_assets = len(self.symbols)
+            bounds = [(0.0, 1.0) for _ in range(n_assets)]
+            constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+            
+            # Objective function: maximize Sharpe ratio
+            def objective(weights):
+                portfolio_return = np.dot(weights, expected_returns)
+                portfolio_volatility = np.sqrt(weights.T @ cov_matrix @ weights)
+                return -portfolio_return / portfolio_volatility  # Minimize negative Sharpe
+            
+            # Initial guess (equal weights)
+            init_weights = np.ones(n_assets) / n_assets
+            
+            # Run optimization
+            result = minimize(
+                objective,
+                init_weights,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints
+            )
+            
+            if result.success:
+                optimal_weights = result.x
+                optimal_weights /= optimal_weights.sum()  # Ensure normalization
+                return dict(zip(self.symbols, optimal_weights))
+
+            logger.error("MVO optimization failed: %s", result.message)
+            return None
+            
+        except Exception as e:
+            logger.error("Error in MVO calculation: %s", str(e))
+            return None
+
+    async def _execute_mvo_rebalance(self, target_weights: dict):
+        """Execute trades to achieve target portfolio weights"""
+        current_values = {}
+        total_value = self.portfolio.value()
+        
+        # Get current prices and position values
+        for symbol in self.symbols:
+            data = await self.data_handler.get_historical_data(symbol, 1)
+            price = data['Close'].iloc[-1]
+            current_qty = self.portfolio.positions.get(symbol, 0)
+            current_values[symbol] = current_qty * price
+        
+        # Calculate target values and deltas
+        trades = []
+        for symbol, weight in target_weights.items():
+            target_value = total_value * weight
+            current_value = current_values.get(symbol, 0)
+            delta = target_value - current_value
+            trades.append((symbol, delta))
+        # Execute trades
+        for symbol, delta in trades:
+            if abs(delta) < 1e-6:  # Skip negligible trades
+                continue
+                
+            data = await self.data_handler.get_historical_data(symbol, 1)
+            price = data['Close'].iloc[-1]
+            
+            # Calculate quantity to trade
+            qty = delta / price
+            
+            # Execute trade directly (bypass signal system)
+            await self._execute_trade(
+                symbol=symbol,
+                signal=np.sign(qty),  # Direction only, quantity handled differently
+                price=price,
+                override_qty=abs(qty)  # New parameter to handle MVO quantities
+            )
 
     def _optimize_weights(self, window_start: int, window_end: int):
         """Optimize strategy weights using specified historical window"""
@@ -495,7 +616,7 @@ class TradingEngine:
             # Update strategy weights
             for i, strategy in enumerate(strategies):
                 strategy.params['weight'] = best_weights[i]
-            logger.info(f"Updated {symbol} weights: {best_weights}")
+            # logger.info(f"Updated {symbol} weights: {best_weights}")
 
     def _signal_to_numeric(self, signal: dict) -> float:
         """Convert signal dict to numeric value"""
@@ -608,7 +729,13 @@ config = {
     'walk_forward': {
         'optimization_window_days': 180,  # 6 months
         'out_of_sample_window_days': 21   # ~1 month
-    }
+    },
+    'mvo_enabled': False,  # Set to False to turn off MVO
+
+    'rebalance_frequency': 30,  # Rebalance every 30 days
+    'mvo_lookback': 252,        # Use 1 year of data for MVO
+    # Optional: disable strategies if using pure MVO
+    # 'strategies': {}            # Empty strategies to use only MVO
 }
 
 if __name__ == "__main__":
