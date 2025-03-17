@@ -6,6 +6,7 @@ from dash.dependencies import Input, Output, State
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
+from algo_trading_system import TradingEngine, config, Backtester
 
 class TradingDashboard:
     def __init__(self, trading_engine):
@@ -304,7 +305,6 @@ class TradingDashboard:
 
 if __name__ == "__main__":
     import asyncio
-    from algo_trading_system import TradingEngine, config, Backtester
     
     # Initialize trading engine
     engine = TradingEngine(config)
