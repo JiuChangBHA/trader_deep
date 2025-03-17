@@ -66,7 +66,6 @@ class BacktestDataHandler(DataHandler):
 
             # Assuming data is stored in CSV files named by symbol
             csv_files = [f for f in os.listdir(self.data_path) if f.endswith('.csv')]
-            logger.info(f"Found {len(csv_files)} CSV files in {self.data_path}.")
             if not csv_files:
                 logger.warning(f"No CSV files found in {self.data_path}.")
                 return data
@@ -263,7 +262,7 @@ class Portfolio:
         self.current_prices = prices
         # Update history with current portfolio value
         self.history.append({
-            'date': pd.Timestamp.now(),
+            'date': pd.Timestamp.now().isoformat(),
             'value': self.value()
         })
 
@@ -272,19 +271,21 @@ class Portfolio:
                      for sym, amt in self.positions.items())
         return self.cash + pos_value
     
-    def _update_portfolio(self, symbol: str, amount: float, price: float):
-        self.trade_history.append({
-            'timestamp': pd.Timestamp.now().isoformat(),
+    def _update_portfolio(self, symbol: str, amount: float, price: float, current_date: pd.Timestamp = None, day: int = None):
+        trade_entry = {
+            'timestamp': current_date.isoformat() if current_date else pd.Timestamp.now().isoformat(),
             'symbol': symbol,
             'action': 'BUY' if amount > 0 else 'SELL',
             'amount': abs(amount),
             'price': price,
-            'value': abs(amount) * price
-        })
+            'value': abs(amount) * price,
+            'day': day  # Track the backtest day
+        }
+        self.trade_history.append(trade_entry)
 
     def snapshot_state(self, current_date):
         self.historical_states.append({
-            'date': current_date,
+            'date': current_date.isoformat(),
             'value': self.value(),
             'positions': {sym: {'amount': amt, 'price': self.current_prices.get(sym, 0)}
                           for sym, amt in self.positions.items()},
@@ -299,7 +300,15 @@ class TradingEngine:
         self.risk_manager = RiskManager(config.get('initial_equity', 100000))
         self.portfolio = Portfolio(config.get('initial_equity', 100000))
         self.signal_aggregator = SignalAggregator(self.strategies, self.risk_manager)
-        
+        self.current_date = None
+        self.current_day = 0
+
+        # Walk-forward optimization parameters
+        wf_config = config.get('walk_forward', {})
+        self.optimization_window_days = wf_config.get('optimization_window_days', 180)
+        self.out_of_sample_window_days = wf_config.get('out_of_sample_window_days', 30)
+        self.last_optimization_day = -self.optimization_window_days
+
         if self.mode == TradingMode.LIVE:
             self.data_handler = AlpacaDataHandler(config['api_key'], config['secret_key'])
             self.trading_client = TradingClient(config['api_key'], config['secret_key'])
@@ -332,9 +341,9 @@ class TradingEngine:
                 latest_data = await self.data_handler.get_latest_data(symbol)
                 current_price = latest_data['Close'].iloc[0]
                 prices[symbol] = current_price
-                
+                self.risk_manager.current_equity = self.portfolio.value()
                 signal = self.signal_aggregator.process_signals(symbol, data)
-                if signal is not None:
+                if signal is not None and signal != 0:
                     await self._execute_trade(symbol, signal, current_price)
             
             self.portfolio.update_prices(prices)
@@ -344,9 +353,19 @@ class TradingEngine:
             logger.error(f"Trading cycle error: {e}")
 
     async def _execute_trade(self, symbol: str, signal: float, price: float):
+        
         position_size = self.risk_manager.calculate_position_size(symbol, price)
         amount = signal * position_size
-        
+        current_amount = self.portfolio.positions.get(symbol, 0)
+        if amount < 0:
+            amount = max(amount, -current_amount)
+        else:
+            max_amount = self.portfolio.cash / price
+            amount = min(amount, max_amount)
+        # Skip the trade entirely if we have nothing to sell
+        if abs(amount) < 1e-6:
+            # logger.info(f"Skipping sell for {symbol}: no shares to sell")
+            return
         if self.mode == TradingMode.LIVE:
             order = MarketOrderRequest(
                 symbol=symbol,
@@ -361,11 +380,21 @@ class TradingEngine:
     def _update_portfolio(self, symbol: str, amount: float, price: float):
         current_amount = self.portfolio.positions.get(symbol, 0)
         cost = amount * price
-        if self.portfolio.cash >= cost:
+        if self.portfolio.cash >= cost and cost != 0:
+            # Safety check: ensure we have enough shares for sells
+            if amount < 0 and abs(amount) > current_amount:
+                logger.warning(f"Safety check triggered: Attempted to sell {abs(amount):.2f} shares of {symbol} but only have {current_amount:.2f}")
+                return  # Skip this trade
+                
+            # Safety check: ensure we have enough cash for buys    
+            if amount > 0 and cost > self.portfolio.cash:
+                logger.warning(f"Safety check triggered: Insufficient cash (${self.portfolio.cash:.2f}) to buy {amount:.2f} shares of {symbol} at ${price:.2f} (${cost:.2f})")
+                return  # Skip this trade
+                
             self.portfolio.positions[symbol] = current_amount + amount
             self.portfolio.cash -= cost
-            self.portfolio._update_portfolio(symbol, amount, price)
-            logger.info(f"Executed {amount:.2f} shares of {symbol} @ {price:.2f}")
+            self.portfolio._update_portfolio(symbol, amount, price, self.current_date, self.current_day)
+            # logger.info(f"Date: {self.current_date.strftime('%Y-%m-%d')}, Day: {self.current_day}, Executed {amount:.2f} shares of {symbol} @ {price:.2f}")
 
     async def _run_backtest(self):
         handler = self.data_handler
@@ -388,29 +417,125 @@ class TradingEngine:
         self.portfolio.trade_history = []
         
         for day in range(max_days):
+            self.current_day = day
+            self.current_date = self.backtest_dates[day]
             handler.current_idx = day
+            # Walk-forward optimization check
+            if (day >= self.optimization_window_days and 
+                (day - self.last_optimization_day) >= self.out_of_sample_window_days):
+                window_start = day - self.optimization_window_days
+                window_end = day - 1
+                self._optimize_weights(window_start, window_end)
+                self.last_optimization_day = day
             await self._trading_cycle()
             
             # Get the current date from the data
-            current_date = self.backtest_dates[day]
-            self.portfolio.snapshot_state(current_date)
+            self.portfolio.snapshot_state(self.current_date)
             
             # Update portfolio history with the current date and value
             self.portfolio.history.append({
-                'date': current_date,
+                'date': self.current_date.isoformat(),
                 'value': self.portfolio.value()
             })
             
             self.backtest_results.append(self.portfolio.value())
-            logger.info(f"Day {day+1}: Portfolio Value {self.backtest_results[-1]:.2f}")
+            # logger.info(f"Date: {current_date.strftime('%Y-%m-%d')}, Day: {day}: Portfolio Value {self.backtest_results[-1]:.2f}")
         
+        logger.info(f"Backtest complete. Total trades: {len(self.portfolio.trade_history)}")
         # Prepare data for the dashboard
         self.backtest_data = {
             'history': self.portfolio.historical_states,
-            'trades': [{'day': i, 'date': self.backtest_dates[min(i, len(self.backtest_dates)-1)].strftime('%Y-%m-%d'), **t} 
-                      for i, t in enumerate(self.portfolio.trade_history)]
+            'trades': [
+                {
+                    'day': t['day'],
+                    'date': pd.to_datetime(t['timestamp']).strftime('%Y-%m-%d'),
+                    'symbol': t['symbol'],
+                    'action': t['action'],
+                    'amount': t['amount'],
+                    'price': t['price'],
+                    'value': t['value']
+                }
+                for t in self.portfolio.trade_history
+            ]
         }
 
+    def _optimize_weights(self, window_start: int, window_end: int):
+        """Optimize strategy weights using specified historical window"""
+        # logger.info(f"\n=== Optimizing weights using window {window_start}-{window_end} ===")
+        
+        for symbol in self.symbols:
+            if symbol not in self.data_handler.data:
+                continue
+
+            full_data = self.data_handler.data[symbol]
+            if len(full_data) < window_end:
+                continue
+
+            window_data = full_data.iloc[window_start:window_end+1]
+            strategies = self.strategies[symbol]
+            
+            # Generate signals for each strategy in window
+            strategy_signals = []
+            for strategy in strategies:
+                signals = []
+                for i in range(len(window_data)):
+                    data_slice = window_data.iloc[:i+1]
+                    try:
+                        signal = strategy.calculate_signal(data_slice)
+                        num_signal = self._signal_to_numeric(signal)
+                    except Exception as e:
+                        logger.error(f"Signal error: {e}")
+                        num_signal = 0
+                    signals.append(num_signal)
+                strategy_signals.append(signals)
+
+            # Find optimal weights
+            best_weights = self._find_optimal_weights(strategy_signals, window_data)
+            
+            # Update strategy weights
+            for i, strategy in enumerate(strategies):
+                strategy.params['weight'] = best_weights[i]
+            logger.info(f"Updated {symbol} weights: {best_weights}")
+
+    def _signal_to_numeric(self, signal: dict) -> float:
+        """Convert signal dict to numeric value"""
+        action_map = {'BUY': 1, 'SELL': -1, 'HOLD': 0}
+        return action_map[signal['action']] * signal.get('strength', 0)
+
+    def _find_optimal_weights(self, strategy_signals: List[List[float]], data: pd.DataFrame) -> List[float]:
+        """Grid search to find weights maximizing Sharpe ratio"""
+        best_sharpe = -np.inf
+        best_weights = [1/len(strategy_signals)] * len(strategy_signals)  # Default equal weights
+        
+        # Generate all possible weight combinations for two strategies
+        if len(strategy_signals) == 2:
+            closes = data['Close'].values
+            returns = np.diff(closes) / closes[:-1] if len(closes) > 1 else []
+            
+            for w1 in np.linspace(0, 1, 21):  # 0.0, 0.05, ..., 1.0
+                w2 = 1 - w1
+                combined = []
+                for s1, s2 in zip(strategy_signals[0][:-1], strategy_signals[1][:-1]):
+                    combined.append(w1*s1 + w2*s2)
+                
+                if len(returns) == 0 or len(combined) == 0:
+                    continue
+                
+                strategy_returns = [c*r for c, r in zip(combined, returns)]
+                sharpe = self._calculate_sharpe(strategy_returns)
+                
+                if sharpe > best_sharpe:
+                    best_sharpe = sharpe
+                    best_weights = [w1, w2]
+        
+        return best_weights
+
+    def _calculate_sharpe(self, returns: List[float]) -> float:
+        """Calculate annualized Sharpe ratio"""
+        if not returns or np.std(returns) == 0:
+            return -np.inf
+        return np.mean(returns) / np.std(returns) * np.sqrt(252)
+    
     async def _update_risk_metrics(self):
         # Update volatility metrics
         for symbol in self.symbols:
@@ -465,16 +590,24 @@ config = {
     'secret_key': 'mPWPeY6T2TfyiAv7ebrFDejhFa0yhH1Xlj57v0lb',
     'data_path': 'C:/Users/jchang427/OneDrive - Georgia Institute of Technology/Random Projects/trading_sim_cursor/src/main/resources/market_data/2025-03-10-07-28_market_data_export_2020-03-11_to_2025-03-10',  # Simplified path that will use synthetic data
     'initial_equity': 100000,
-    'symbols': ['AAPL', 'MSFT'],
+    'symbols': ['AAPL', 'MSFT', 'NVDA'],
     'strategies': {
         'AAPL': {
-            'mean_reversion': {'lookback': 20, 'threshold': 2.0, 'weight': 0.6},
-            'bollinger_bands': {'lookback': 20, 'num_std': 2, 'weight': 0.4}
+            'mean_reversion': {'lookback': 25, 'threshold': 2.5, 'weight': 0.9165/(0.9165+0.7755)},
+            'bollinger_bands': {'lookback': 27, 'num_std': 2, 'weight': 0.7755/(0.9165+0.7755)}
         },
         'MSFT': {
-            'mean_reversion': {'lookback': 30, 'threshold': 1.8, 'weight': 0.5},
-            'bollinger_bands': {'lookback': 25, 'num_std': 1.5, 'weight': 0.5}
+            'mean_reversion': {'lookback': 15, 'threshold': 1.25, 'weight': 0.9301/(1.0791+0.9301)},
+            'bollinger_bands': {'lookback': 14, 'num_std': 2.25, 'weight': 1.0791/(1.0791+0.9301)}
+        },
+        'NVDA': {
+            'mean_reversion': {'lookback': 15, 'threshold': 1.25, 'weight': 0.9301/(1.0791+0.9301)},
+            'bollinger_bands': {'lookback': 14, 'num_std': 2.25, 'weight': 1.0791/(1.0791+0.9301)}
         }
+    },
+    'walk_forward': {
+        'optimization_window_days': 180,  # 6 months
+        'out_of_sample_window_days': 21   # ~1 month
     }
 }
 
