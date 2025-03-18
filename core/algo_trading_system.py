@@ -221,8 +221,23 @@ class MovingAverageCrossoverStrategy(TradingStrategy):
         
         # Create a proper copy of the DataFrame to avoid SettingWithCopyWarning
         data_copy = data.copy()
-        data_copy['Short_MA'] = data_copy[f'MA_{short_window}']
-        data_copy['Long_MA'] = data_copy[f'MA_{long_window}']
+        
+        # Check if required MA columns exist, calculate them if they don't
+        short_ma_col = f'MA_{short_window}'
+        long_ma_col = f'MA_{long_window}'
+        
+        if short_ma_col not in data_copy.columns:
+            data_copy[short_ma_col] = data_copy['Close'].rolling(window=short_window, min_periods=1).mean()
+            
+        if long_ma_col not in data_copy.columns:
+            data_copy[long_ma_col] = data_copy['Close'].rolling(window=long_window, min_periods=1).mean()
+        
+        data_copy['Short_MA'] = data_copy[short_ma_col]
+        data_copy['Long_MA'] = data_copy[long_ma_col]
+
+        # Ensure we have at least 2 values for comparison
+        if len(data_copy) < 2:
+            return {'action': 'HOLD', 'strength': 0}
 
         if data_copy['Short_MA'].iloc[-1] > data_copy['Long_MA'].iloc[-1] and data_copy['Short_MA'].iloc[-2] <= data_copy['Long_MA'].iloc[-2]:
             return {'action': 'BUY', 'strength': 1.0}
@@ -241,7 +256,20 @@ class RSIStrategy(TradingStrategy):
         
         # Create a proper copy of the DataFrame to avoid SettingWithCopyWarning
         data_copy = data.copy()
-        rsi = data_copy[f'RSI_{period}'].iloc[-1]
+        
+        # Check if RSI column exists, calculate it if it doesn't
+        rsi_col = f'RSI_{period}'
+        if rsi_col not in data_copy.columns:
+            # Calculate RSI
+            delta = data_copy['Close'].diff()
+            gain = delta.where(delta > 0, 0)
+            loss = -delta.where(delta < 0, 0)
+            avg_gain = gain.rolling(window=period, min_periods=1).mean()
+            avg_loss = loss.rolling(window=period, min_periods=1).mean()
+            rs = avg_gain / (avg_loss + 1e-9)  # Add small value to avoid division by zero
+            data_copy[rsi_col] = 100 - (100 / (1 + rs))
+        
+        rsi = data_copy[rsi_col].iloc[-1]
         
         if rsi < oversold:
             return {'action': 'BUY', 'strength': (oversold - rsi) / oversold}
@@ -251,16 +279,36 @@ class RSIStrategy(TradingStrategy):
     
 class MeanReversionStrategy(TradingStrategy):
     def calculate_signal(self, data: pd.DataFrame) -> dict:
-        closes = data['Close'].values
         lookback = self.params.get('lookback', 20)
         threshold = self.params.get('threshold', 2.0)
         
-        if len(closes) < lookback:
+        if len(data) < lookback:
             return {'action': 'HOLD', 'strength': 0}
         
-        moving_avg = np.mean(closes[-lookback:])
-        std_dev = np.std(closes[-lookback:])
+        # Create a proper copy of the DataFrame
+        data_copy = data.copy()
+        
+        # Calculate mean and standard deviation directly from price data
+        # This avoids the need for precomputed indicators
+        closes = data_copy['Close'].values
         current_price = closes[-1]
+        
+        # Use the moving_avg and std_dev columns if they exist
+        ma_col = f'MA_{lookback}'
+        std_col = f'Std_{lookback}'
+        
+        if ma_col in data_copy.columns and std_col in data_copy.columns:
+            # Use precomputed values
+            moving_avg = data_copy[ma_col].iloc[-1]
+            std_dev = data_copy[std_col].iloc[-1]
+        else:
+            # Calculate directly
+            moving_avg = np.mean(closes[-lookback:])
+            std_dev = np.std(closes[-lookback:])
+        
+        # Avoid division by zero
+        if std_dev < 1e-9:
+            return {'action': 'HOLD', 'strength': 0}
         
         z_score = (current_price - moving_avg) / std_dev
         if z_score < -threshold:
@@ -271,18 +319,36 @@ class MeanReversionStrategy(TradingStrategy):
 
 class BollingerBandsStrategy(TradingStrategy):
     def calculate_signal(self, data: pd.DataFrame) -> dict:
-        closes = data['Close'].values
         lookback = self.params.get('lookback', 20)
         num_std = self.params.get('num_std', 2)
         
-        if len(closes) < lookback:
+        if len(data) < lookback:
             return {'action': 'HOLD', 'strength': 0}
         
-        moving_avg = np.mean(closes[-lookback:])
-        std_dev = np.std(closes[-lookback:])
+        # Create a proper copy of the DataFrame
+        data_copy = data.copy()
+        closes = data_copy['Close'].values
+        current_price = closes[-1]
+        
+        # Use the moving_avg and std_dev columns if they exist
+        ma_col = f'MA_{lookback}'
+        std_col = f'Std_{lookback}'
+        
+        if ma_col in data_copy.columns and std_col in data_copy.columns:
+            # Use precomputed values
+            moving_avg = data_copy[ma_col].iloc[-1]
+            std_dev = data_copy[std_col].iloc[-1]
+        else:
+            # Calculate directly
+            moving_avg = np.mean(closes[-lookback:])
+            std_dev = np.std(closes[-lookback:])
+        
+        # Avoid issues with very low volatility
+        if std_dev < 1e-9:
+            return {'action': 'HOLD', 'strength': 0}
+            
         upper_band = moving_avg + num_std * std_dev
         lower_band = moving_avg - num_std * std_dev
-        current_price = closes[-1]
         
         if current_price > upper_band:
             return {'action': 'SELL', 'strength': (current_price - upper_band)/std_dev}
@@ -339,8 +405,16 @@ class SignalAggregator:
                 normalized = self._normalize_signal(signal)
                 weighted = self._apply_strategy_weights(strategy, normalized, total_weight)
                 raw_signals.append(weighted)
+            except KeyError as e:
+                # Log the specific missing key and strategy type
+                logger.error(f"Signal error in {strategy.__class__.__name__}: Missing key '{str(e)}' for symbol {symbol}")
+                # Continue with other strategies
             except Exception as e:
-                logger.error(f"Signal error in {strategy.__class__.__name__}: {str(e)}")
+                # Log the general error with traceback
+                logger.error(f"Signal error in {strategy.__class__.__name__} for {symbol}: {str(e)}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                # Continue with other strategies
 
         if not raw_signals:
             return None
@@ -442,69 +516,110 @@ class TradingEngine:
 
     def _precompute_indicators(self):
         """Precompute indicators based on optimized parameters from JSON"""
-        # Load optimized parameters
-        with open("optimized_params.json") as f:
-            optimized_params = json.load(f)["params"]
-        
-        indicator_config = defaultdict(lambda: {
-            'moving_averages': set(),
-            'rsi_periods': set(),
-            'bollinger_windows': set(),
-            'meanreversion_windows': set()
-        })
+        try:
+            # Load optimized parameters if file exists
+            optimized_params = {}
+            try:
+                if os.path.exists("optimized_params.json"):
+                    with open("optimized_params.json") as f:
+                        optimized_params = json.load(f)["params"]
+                    logger.info("Loaded cached params from optimized_params.json")
+            except Exception as e:
+                logger.warning(f"Could not load optimized parameters: {e}")
+                
+            indicator_config = defaultdict(lambda: {
+                'moving_averages': set(),
+                'rsi_periods': set(),
+                'bollinger_windows': set(),
+                'meanreversion_windows': set()
+            })
 
-        # Parse parameters from JSON structure
-        for strategy_key, params in optimized_params.items():
-            # Convert string key to tuple ("('AAPL', 'Strategy')" -> ("AAPL", "Strategy"))
-            symbol, strategy_name = map(str.strip, strategy_key.strip("()").split(",", 1))
-            symbol = symbol.strip("'")
-            strategy_name = strategy_name.strip(" '")  # Handle quotes in strategy names
+            # Parse parameters from JSON structure
+            for strategy_key, params in optimized_params.items():
+                try:
+                    # Convert string key to tuple ("('AAPL', 'Strategy')" -> ("AAPL", "Strategy"))
+                    symbol, strategy_name = map(str.strip, strategy_key.strip("()").split(",", 1))
+                    symbol = symbol.strip("'")
+                    strategy_name = strategy_name.strip(" '")  # Handle quotes in strategy names
 
-            # Collect parameters for each strategy type
-            if "MovingAverageCrossover" in strategy_name:
-                indicator_config[symbol]['moving_averages'].add(params['short_window'])
-                indicator_config[symbol]['moving_averages'].add(params['long_window'])
-            elif "RSIStrategy" in strategy_name:
-                indicator_config[symbol]['rsi_periods'].add(params['period'])
-            elif "BollingerBandsStrategy" in strategy_name:
-                indicator_config[symbol]['bollinger_windows'].add(params['lookback'])
-            elif "MeanReversionStrategy" in strategy_name:
-                indicator_config[symbol]['meanreversion_windows'].add(params['lookback'])
+                    # Collect parameters for each strategy type
+                    if "MovingAverageCrossover" in strategy_name:
+                        indicator_config[symbol]['moving_averages'].add(params['short_window'])
+                        indicator_config[symbol]['moving_averages'].add(params['long_window'])
+                    elif "RSIStrategy" in strategy_name:
+                        indicator_config[symbol]['rsi_periods'].add(params['period'])
+                    elif "BollingerBandsStrategy" in strategy_name:
+                        indicator_config[symbol]['bollinger_windows'].add(params['lookback'])
+                    elif "MeanReversionStrategy" in strategy_name:
+                        indicator_config[symbol]['meanreversion_windows'].add(params['lookback'])
+                except Exception as e:
+                    logger.error(f"Error processing parameter key {strategy_key}: {e}")
 
-        # Precompute indicators for each symbol
-        for symbol in self.symbols:
-            config = indicator_config[symbol]
-            
-            # Get all unique windows needed for MA calculations
-            ma_windows = set()
-            ma_windows.update(config['moving_averages'])
-            ma_windows.update(config['bollinger_windows'])
-            ma_windows.update(config['meanreversion_windows'])
-            
-            # Precompute indicators
-            df = self.data_handler.data[symbol].copy()
-            
-            # Moving Averages
-            for window in ma_windows:
-                df[f'MA_{window}'] = df['Close'].rolling(window).mean()
-            
-            # Standard Deviations (for Bollinger Bands and Mean Reversion)
-            for window in config['bollinger_windows'].union(config['meanreversion_windows']):
-                df[f'Std_{window}'] = df['Close'].rolling(window).std()
-            
-            # RSI
-            for period in config['rsi_periods']:
-                delta = df['Close'].diff()
-                gain = delta.where(delta > 0, 0)
-                loss = -delta.where(delta < 0, 0)
-                avg_gain = gain.rolling(period).mean()
-                avg_loss = loss.rolling(period).mean()
-                rs = avg_gain / avg_loss
-                df[f'RSI_{period}'] = 100 - (100 / (1 + rs))
-            
-            # Update data with precomputed indicators
-            self.data_handler.data[symbol] = df
-            
+            # Add default indicators if none found
+            for symbol in self.symbols:
+                # Add default moving averages if none found
+                if not indicator_config[symbol]['moving_averages']:
+                    indicator_config[symbol]['moving_averages'].update([10, 20, 50])
+                
+                # Always include RSI with period 14
+                indicator_config[symbol]['rsi_periods'].add(14)
+                
+                # Add default bollinger and meanreversion windows if none found
+                if not indicator_config[symbol]['bollinger_windows']:
+                    indicator_config[symbol]['bollinger_windows'].add(20)
+                if not indicator_config[symbol]['meanreversion_windows']:
+                    indicator_config[symbol]['meanreversion_windows'].add(20)
+
+            # Precompute indicators for each symbol
+            for symbol in self.symbols:
+                if symbol not in self.data_handler.data:
+                    logger.warning(f"No data for symbol {symbol}, skipping indicator calculation")
+                    continue
+                    
+                config = indicator_config[symbol]
+                
+                # Get all unique windows needed for MA calculations
+                ma_windows = set()
+                ma_windows.update(config['moving_averages'])
+                ma_windows.update(config['bollinger_windows'])
+                ma_windows.update(config['meanreversion_windows'])
+                
+                # Precompute indicators
+                df = self.data_handler.data[symbol].copy()
+                
+                # Moving Averages
+                for window in ma_windows:
+                    df[f'MA_{window}'] = df['Close'].rolling(window=window, min_periods=1).mean()
+                
+                # Standard Deviations (for Bollinger Bands and Mean Reversion)
+                for window in config['bollinger_windows'].union(config['meanreversion_windows']):
+                    df[f'Std_{window}'] = df['Close'].rolling(window=window, min_periods=1).std()
+                
+                # RSI
+                for period in config['rsi_periods']:
+                    # Handle division by zero and ensure RSI always has values
+                    delta = df['Close'].diff()
+                    gain = delta.where(delta > 0, 0)
+                    loss = -delta.where(delta < 0, 0)
+                    # Use min_periods=1 to start calculating as soon as possible
+                    avg_gain = gain.rolling(window=period, min_periods=1).mean()
+                    avg_loss = loss.rolling(window=period, min_periods=1).mean()
+                    # Add a small value to avg_loss to avoid division by zero
+                    rs = avg_gain / (avg_loss + 1e-9)  # Add small epsilon to avoid division by zero
+                    df[f'RSI_{period}'] = 100 - (100 / (1 + rs))
+                
+                # Update data with precomputed indicators
+                self.data_handler.data[symbol] = df
+                
+            logger.info("Successfully precomputed indicators for all symbols")
+                
+        except Exception as e:
+            logger.error(f"Error precomputing indicators: {e}")
+            import traceback
+            traceback.print_exc()
+            # Create basic indicators if optimization fails
+            self._create_default_indicators()
+
     def _init_strategies(self, strategy_config: dict) -> Dict[str, List[TradingStrategy]]:
         strategies = {}
         
@@ -641,7 +756,7 @@ class TradingEngine:
         
         # Limit the number of days for faster testing
         max_days = min(len(handler.data[sym]) for sym in self.symbols)
-        max_days = min(max_days, 26)  # Limit to at most 60 days (~ 2 months of trading days)
+        max_days = min(max_days, config['max_backtest_days'])
         
         # Get dates from the first symbol's data
         first_symbol = self.symbols[0]
@@ -844,20 +959,31 @@ class TradingEngine:
         return action_map[signal['action']] * signal.get('strength', 0)
 
     def _find_optimal_weights(self, strategy_signals: List[List[float]], data: pd.DataFrame) -> List[float]:
-        """Grid search to find weights maximizing Sharpe ratio"""
+        """Find optimal weights for multiple strategies to maximize Sharpe ratio"""
         best_sharpe = -np.inf
-        best_weights = [1/len(strategy_signals)] * len(strategy_signals)  # Default equal weights
-
-        # Generate all possible weight combinations for two strategies
-        if len(strategy_signals) == 2:
+        n_strategies = len(strategy_signals)
+        
+        # Default to equal weights
+        best_weights = [1.0 / n_strategies] * n_strategies  
+        
+        # Handle special case of single strategy
+        if n_strategies == 1:
+            return [1.0]
+            
+        # Handle case of two strategies with grid search (efficient)
+        if n_strategies == 2:
             closes = data['Close'].values
             returns = np.diff(closes) / closes[:-1] if len(closes) > 1 else []
             
-            for w1 in np.linspace(0, 1, 3):  # 0.0, 0.05, ..., 1.0
+            for w1 in np.linspace(0, 1, 21):  # 0.0, 0.05, ..., 1.0
                 w2 = 1 - w1
+                weights = [w1, w2]
+                
                 combined = []
-                for s1, s2 in zip(strategy_signals[2][:-1], strategy_signals[3][:-1]):
-                    combined.append(w1*s1 + w2*s2)
+                for i in range(len(strategy_signals[0][:-1])):
+                    # Weighted sum of signals
+                    combined_signal = sum(w * strategy_signals[j][i] for j, w in enumerate(weights))
+                    combined.append(combined_signal)
                 
                 if len(returns) == 0 or len(combined) == 0:
                     continue
@@ -867,10 +993,55 @@ class TradingEngine:
                 
                 if sharpe > best_sharpe:
                     best_sharpe = sharpe
-                    best_weights = [0] * (len(strategy_signals) - 2) + [w1, w2]
+                    best_weights = weights
+        
+        # For 3 or more strategies, use a simplified approach (slower but general)
+        elif n_strategies >= 3:
+            closes = data['Close'].values
+            returns = np.diff(closes) / closes[:-1] if len(closes) > 1 else []
+            
+            if len(returns) == 0:
+                return best_weights
+                
+            # Test a limited set of weight combinations
+            # For 3+ strategies, we'll try some pre-defined weight distributions
+            weight_combinations = []
+            
+            # Equal weights
+            weight_combinations.append([1.0/n_strategies] * n_strategies)
+            
+            # Single dominant strategy with equal remainder
+            for i in range(n_strategies):
+                weights = [0.1/(n_strategies-1)] * n_strategies
+                weights[i] = 0.9
+                weight_combinations.append(weights)
+            
+            # Pairs of strategies (if we have more than 3)
+            if n_strategies > 3:
+                for i in range(n_strategies):
+                    for j in range(i+1, n_strategies):
+                        weights = [0.05/(n_strategies-2)] * n_strategies
+                        weights[i] = 0.475
+                        weights[j] = 0.475
+                        weight_combinations.append(weights)
+            
+            # Evaluate each weight combination
+            for weights in weight_combinations:
+                combined = []
+                for i in range(len(strategy_signals[0][:-1])):
+                    # Weighted sum of signals
+                    combined_signal = sum(w * strategy_signals[j][i] for j, w in enumerate(weights) if i < len(strategy_signals[j]))
+                    combined.append(combined_signal)
+                
+                strategy_returns = [c*r for c, r in zip(combined, returns)]
+                sharpe = self._calculate_sharpe(strategy_returns)
+                
+                if sharpe > best_sharpe:
+                    best_sharpe = sharpe
+                    best_weights = weights
         
         return best_weights
-
+    
     def _calculate_sharpe(self, returns: List[float]) -> float:
         """Calculate annualized Sharpe ratio"""
         if not returns or np.std(returns) == 0:
@@ -885,6 +1056,45 @@ class TradingEngine:
                 returns = np.diff(np.log(price_history['Close']))
                 volatility = np.std(returns) * np.sqrt(252)
                 self.risk_manager.update_volatility(symbol, volatility)
+
+    def _create_default_indicators(self):
+        """Create default indicators for all symbols when optimization fails"""
+        logger.info("Creating default indicators for all symbols")
+        
+        # Define default periods and windows
+        ma_periods = [10, 20, 50]
+        rsi_period = 14
+        bollinger_window = 20
+        
+        for symbol in self.symbols:
+            if symbol not in self.data_handler.data:
+                logger.warning(f"No data for symbol {symbol}, skipping default indicators")
+                continue
+                
+            # Get the data for this symbol
+            df = self.data_handler.data[symbol].copy()
+            
+            # Calculate moving averages
+            for period in ma_periods:
+                df[f'MA_{period}'] = df['Close'].rolling(window=period, min_periods=1).mean()
+            
+            # Calculate RSI
+            delta = df['Close'].diff()
+            gain = delta.where(delta > 0, 0)
+            loss = -delta.where(delta < 0, 0)
+            avg_gain = gain.rolling(window=rsi_period, min_periods=1).mean()
+            avg_loss = loss.rolling(window=rsi_period, min_periods=1).mean()
+            rs = avg_gain / (avg_loss + 1e-9)  # Avoid division by zero
+            df[f'RSI_{rsi_period}'] = 100 - (100 / (1 + rs))
+            
+            # Calculate Bollinger Bands components
+            df[f'MA_{bollinger_window}'] = df['Close'].rolling(window=bollinger_window, min_periods=1).mean()
+            df[f'Std_{bollinger_window}'] = df['Close'].rolling(window=bollinger_window, min_periods=1).std()
+            
+            # Update the data handler with the new data
+            self.data_handler.data[symbol] = df
+            
+        logger.info("Successfully created default indicators for all symbols")
 
 # Modified TimeSeriesSplit for financial data
 class PurgedTimeSeriesSplit(TimeSeriesSplit):
@@ -916,25 +1126,16 @@ class StrategyOptimizer:
     def optimize_all(self):
         """Optimize parameters for all strategy/symbol combinations"""
         # Try to load cached results first - more aggressive caching
-        if self._load_cached_results():
-            logger.info("Using cached optimization results")
-            return
         
         logger.info("Starting strategy optimization")
 
         # Collect all tasks
         tasks = []
-        # Limit to just one symbol for faster testing
-        sample_symbol = self.engine.symbols[0] if self.engine.symbols else None
-        
-        if sample_symbol:
-            # Just get strategies for one symbol instead of all
-            if sample_symbol in self.engine.strategies:
-                strategies = self.engine.strategies[sample_symbol]
-                # Further limit to at most 2 strategies for quick testing
-                for strategy in strategies[:min(2, len(strategies))]:
-                    strategy_name = strategy.__class__.__name__
-                    tasks.append((sample_symbol, strategy, strategy_name))
+        for symbol in self.engine.symbols:
+            for strategy in self.engine.strategies[symbol]:
+                strategy_name = strategy.__class__.__name__
+                tasks.append((symbol, strategy, strategy_name))
+                
         
         # Use a simpler progress indicator instead of tqdm
         total_tasks = len(tasks)
@@ -1098,7 +1299,7 @@ class StrategyOptimizer:
         """Convert signal dict to numeric value"""
         action_map = {'BUY': 1, 'SELL': -1, 'HOLD': 0}
         return action_map[signal['action']] * signal.get('strength', 0)
-    
+
 class Backtester:
     def __init__(self, config: dict):
         self.config = config
@@ -1166,7 +1367,7 @@ config = {
     'mvo_enabled': False,  # Keep MVO disabled for speed
     'rebalance_frequency': 60,  # Reduced rebalancing frequency (less computation)
     'mvo_lookback': 126,        # Reduced from 252 to 126 (6 months instead of 1 year)
-
+    'max_backtest_days': 120,
     'optimization': {
         'n_trials': 5,  # Reduced from 20
         'cache_ttl_days': 30,  # Increased from 7

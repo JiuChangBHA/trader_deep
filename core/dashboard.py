@@ -1,17 +1,122 @@
 # dashboard.py
 import datetime
 import dash
+import json
+import os
 from dash import dcc, html, dash_table, callback_context
 from dash.dependencies import Input, Output, State
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 from algo_trading_system import TradingEngine, config, Backtester
+from pathlib import Path
+
+# Function to load optimized parameters
+def load_optimized_params():
+    try:
+        # Check if optimized_params.json exists
+        params_file = Path("optimized_params.json")
+        if params_file.exists():
+            with open(params_file, 'r') as f:
+                data = json.load(f)
+            print(f"Loaded optimized parameters from {params_file}")
+            return data
+        else:
+            print(f"File {params_file} not found, using default config")
+            return None
+    except Exception as e:
+        print(f"Error loading optimized parameters: {e}")
+        return None
+
+# Function to update config with optimized parameters
+def update_config_with_optimized_params(config, optimized_data, strategy_toggle='all'):
+    if not optimized_data or 'params' not in optimized_data:
+        return config
+        
+    # Create a copy of the config to modify
+    updated_config = config.copy()
+    
+    # Make sure strategies dict exists
+    if 'strategies' not in updated_config:
+        updated_config['strategies'] = {}
+    
+    # Process optimized parameters
+    for param_key, param_values in optimized_data['params'].items():
+        # Parse the key format: "('AAPL', 'MovingAverageCrossoverStrategy')"
+        try:
+            # Strip parentheses and split by comma
+            parts = param_key.strip("()").split(", ")
+            if len(parts) == 2:
+                symbol, strategy_name = parts
+                
+                # Remove quotes if present
+                symbol = symbol.strip("'")
+                strategy_name = strategy_name.strip("'")
+                
+                # Map class names to strategy config names
+                strategy_name_map = {
+                    'MovingAverageCrossoverStrategy': 'moving_average_crossover',
+                    'RSIStrategy': 'rsi',
+                    'MeanReversionStrategy': 'mean_reversion',
+                    'BollingerBandsStrategy': 'bollinger_bands'
+                }
+                
+                # Get the strategy config name
+                strategy_config_name = strategy_name_map.get(strategy_name)
+                if not strategy_config_name:
+                    continue
+                    
+                # Filter strategies if toggle is set to 'mb_only'
+                if strategy_toggle == 'mb_only' and strategy_config_name not in ['mean_reversion', 'bollinger_bands']:
+                    continue
+                
+                # Initialize symbol strategies if needed
+                if symbol not in updated_config['strategies']:
+                    updated_config['strategies'][symbol] = {}
+                
+                # Add or update the strategy parameters
+                updated_config['strategies'][symbol][strategy_config_name] = param_values
+        except Exception as e:
+            print(f"Error processing parameter key {param_key}: {e}")
+    
+    # Set symbols based on what's in the strategies
+    updated_config['symbols'] = list(updated_config['strategies'].keys())
+    
+    print(f"Updated config with optimized parameters, using strategy toggle: {strategy_toggle}")
+    return updated_config
+
+# Function to load benchmark data (SPY and QQQ)
+def load_benchmark_data():
+    benchmark_data = {}
+    benchmark_dir = r"C:\Users\jchang427\OneDrive - Georgia Institute of Technology\Random Projects\trading_sim_cursor\src\main\resources\market_data\market_data_export_2020-03-18_to_2022-12-13"
+    
+    for symbol in ['SPY', 'QQQ']:
+        file_path = os.path.join(benchmark_dir, f"{symbol}_data.csv")
+        try:
+            if os.path.exists(file_path):
+                df = pd.read_csv(file_path)
+                # Ensure we have a Date column and it's properly formatted
+                if 'Date' in df.columns:
+                    df['Date'] = pd.to_datetime(df['Date'])
+                    # Normalize data to 100 at the start for easier comparison
+                    df = df.sort_values('Date')
+                    df['Normalized'] = df['Close'] / df['Close'].iloc[0] * 100
+                    benchmark_data[symbol] = df
+                    print(f"Loaded benchmark data for {symbol}")
+                else:
+                    print(f"No Date column found in {symbol} data")
+            else:
+                print(f"Benchmark file not found: {file_path}")
+        except Exception as e:
+            print(f"Error loading benchmark data for {symbol}: {e}")
+    
+    return benchmark_data
 
 class TradingDashboard:
     def __init__(self, trading_engine):
         self.engine = trading_engine
         self.app = dash.Dash(__name__)
+        self.benchmark_data = load_benchmark_data()
         self.setup_layout()
         self.setup_callbacks()
 
@@ -30,6 +135,45 @@ class TradingDashboard:
                     style={'width': '300px', 'margin': '10px'}
                 ),
                 html.Div([
+                    # Add strategy selection toggle
+                    html.Div([
+                        html.Label("Strategy Selection:"),
+                        dcc.RadioItems(
+                            id='strategy-toggle',
+                            options=[
+                                {'label': 'All Strategies', 'value': 'all'},
+                                {'label': 'Mean Reversion & Bollinger Bands Only', 'value': 'mb_only'}
+                            ],
+                            value='mb_only',
+                            labelStyle={'display': 'block'}
+                        ),
+                        html.Button(
+                            'Apply Strategy Selection',
+                            id='apply-strategy-btn',
+                            style={
+                                'backgroundColor': '#3498db',
+                                'color': 'white',
+                                'border': 'none',
+                                'padding': '10px 20px',
+                                'margin': '10px 0',
+                                'borderRadius': '5px'
+                            }
+                        ),
+                        html.Button(
+                            'Run Backtest',
+                            id='run-backtest-btn',
+                            style={
+                                'backgroundColor': '#2ecc71',
+                                'color': 'white',
+                                'border': 'none',
+                                'padding': '10px 20px',
+                                'margin': '10px 0',
+                                'borderRadius': '5px'
+                            }
+                        ),
+                        html.Div(id='status-display', style={'marginTop': '10px'})
+                    ], style={'padding': '20px', 'backgroundColor': '#f8f9fa', 'borderRadius': '5px', 'marginBottom': '10px'}),
+                    
                     dcc.Slider(
                         id='timeline-slider',
                         min=0,
@@ -46,6 +190,19 @@ class TradingDashboard:
             dcc.Tabs([
                 dcc.Tab(label='Performance Overview', children=[
                     html.Div([
+                        # Add benchmark display toggles
+                        html.Div([
+                            html.Label("Benchmark Comparison:"),
+                            dcc.Checklist(
+                                id='benchmark-toggles',
+                                options=[
+                                    {'label': 'SPY (S&P 500)', 'value': 'SPY'},
+                                    {'label': 'QQQ (NASDAQ-100)', 'value': 'QQQ'}
+                                ],
+                                value=['SPY'],
+                                labelStyle={'display': 'inline-block', 'marginRight': '15px'}
+                            )
+                        ], style={'marginBottom': '10px'}),
                         dcc.Graph(id='equity-curve'),
                         dcc.Graph(id='drawdown-chart'),
                         html.Div(id='performance-metrics')
@@ -86,7 +243,8 @@ class TradingDashboard:
                 disabled=False
             ),
             
-            dcc.Store(id='backtest-data-store')
+            dcc.Store(id='backtest-data-store'),
+            dcc.Store(id='current-config-store')
         ], style={'fontFamily': 'Arial, sans-serif'})
 
     def setup_callbacks(self):
@@ -108,6 +266,61 @@ class TradingDashboard:
                     return 0, {}, 0, True, True
             return 0, {}, 0, True, False
 
+        # Callback for strategy selection toggle
+        @self.app.callback(
+            [Output('status-display', 'children'),
+             Output('current-config-store', 'data')],
+            [Input('apply-strategy-btn', 'n_clicks'),
+             Input('run-backtest-btn', 'n_clicks')],
+            [State('strategy-toggle', 'value'),
+             State('status-display', 'children')]
+        )
+        def handle_button_actions(apply_clicks, run_clicks, strategy_toggle, current_status):
+            ctx = callback_context
+            triggered_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+            
+            if not triggered_id or (not apply_clicks and not run_clicks):
+                return "Ready to run backtest", {'strategy_toggle': strategy_toggle}
+            
+            # Handle Apply Strategy Selection button
+            if triggered_id == 'apply-strategy-btn':
+                return f"Strategy selection applied: {'All strategies' if strategy_toggle == 'all' else 'Mean Reversion & Bollinger Bands only'}", {'strategy_toggle': strategy_toggle}
+            
+            # Handle Run Backtest button
+            elif triggered_id == 'run-backtest-btn':
+                try:
+                    # Load optimized parameters
+                    optimized_data = load_optimized_params()
+                    
+                    # Update config with optimized parameters based on toggle
+                    updated_config = update_config_with_optimized_params(config, optimized_data, strategy_toggle)
+                    
+                    # Set max_backtest_days in the config for quicker testing
+                    updated_config['max_backtest_days'] = 120  # Limit to 120 days for reasonable testing
+                    
+                    # Create and run a new trading engine with updated config
+                    trading_engine = TradingEngine(updated_config)
+                    self.engine = trading_engine  # Update the dashboard's trading engine
+                    
+                    # Run backtest
+                    import asyncio
+                    asyncio.run(trading_engine._run_backtest())
+                    
+                    # Update UI component data
+                    self._update_component_data()
+                    
+                    # Return status message
+                    strategies_used = "all strategies" if strategy_toggle == 'all' else "mean reversion and bollinger bands only"
+                    return f"Backtest completed using {strategies_used}", {'strategy_toggle': strategy_toggle}
+                except Exception as e:
+                    print(f"Error in run_backtest_with_strategies: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return f"Error running backtest: {str(e)}", {'strategy_toggle': strategy_toggle}
+            
+            # Default case
+            return current_status, {'strategy_toggle': strategy_toggle}
+
         @self.app.callback(
             [Output('equity-curve', 'figure'),
              Output('drawdown-chart', 'figure'),
@@ -119,9 +332,10 @@ class TradingDashboard:
              Output('backtest-data-store', 'data')],
             [Input('interval-component', 'n_intervals'),
              Input('timeline-slider', 'value'),
-             Input('mode-selector', 'value')]
+             Input('mode-selector', 'value'),
+             Input('benchmark-toggles', 'value')]  # Add input for benchmark toggles
         )
-        def update_all_components(n, slider_day, mode):
+        def update_all_components(n, slider_day, mode, selected_benchmarks):
             ctx = callback_context
             triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
             
@@ -134,7 +348,7 @@ class TradingDashboard:
                 live_results = self.update_live_mode()
                 return *live_results, backtest_data
             else:
-                backtest_results = self.update_backtest_mode(slider_day, backtest_data)
+                backtest_results = self.update_backtest_mode(slider_day, backtest_data, selected_benchmarks)
                 return *backtest_results, backtest_data
 
     def update_live_mode(self):
@@ -160,7 +374,7 @@ class TradingDashboard:
         
         return equity_fig, drawdown_fig, metrics_html, current_positions, risk_fig, vol_display, trade_history
 
-    def update_backtest_mode(self, day, backtest_data):
+    def update_backtest_mode(self, day, backtest_data, selected_benchmarks=None):
         if not backtest_data:
             # Return empty defaults if data is missing
             empty_fig = go.Figure()
@@ -196,12 +410,67 @@ class TradingDashboard:
         
         # Equity Curve up to the selected day.
         equity_df = pd.DataFrame(backtest_data['history'][:day+1])
-        equity_fig = go.Figure(go.Scatter(
+        # Convert string dates to datetime
+        equity_df['date'] = pd.to_datetime(equity_df['date'])
+        
+        # Normalize the equity values for percentage comparison
+        first_value = equity_df['value'].iloc[0] if not equity_df.empty else 100000
+        equity_df['normalized_value'] = equity_df['value'] / first_value * 100
+        
+        # Create the equity curve figure
+        equity_fig = go.Figure()
+        
+        # Add the portfolio equity curve
+        equity_fig.add_trace(go.Scatter(
             x=equity_df['date'],
-            y=equity_df['value'],
-            line=dict(color='#3498db')
+            y=equity_df['normalized_value'],
+            mode='lines',
+            name='Portfolio',
+            line=dict(color='#3498db', width=2)
         ))
-        equity_fig.update_layout(title='Historical Equity Curve')
+        
+        # Add benchmark traces if selected and available
+        if selected_benchmarks and self.benchmark_data:
+            start_date = equity_df['date'].min() if not equity_df.empty else None
+            end_date = equity_df['date'].max() if not equity_df.empty else None
+            
+            for symbol in selected_benchmarks:
+                if symbol in self.benchmark_data:
+                    benchmark_df = self.benchmark_data[symbol]
+                    # Filter to the backtest date range
+                    if start_date and end_date:
+                        filtered_df = benchmark_df[(benchmark_df['Date'] >= start_date) & 
+                                                  (benchmark_df['Date'] <= end_date)]
+                        
+                        if not filtered_df.empty:
+                            # Normalize to the same starting point
+                            first_benchmark_value = filtered_df['Close'].iloc[0]
+                            normalized_values = filtered_df['Close'] / first_benchmark_value * 100
+                            
+                            equity_fig.add_trace(go.Scatter(
+                                x=filtered_df['Date'],
+                                y=normalized_values,
+                                mode='lines',
+                                name=symbol,
+                                line=dict(
+                                    color='#e74c3c' if symbol == 'SPY' else '#2ecc71',
+                                    width=1.5,
+                                    dash='dot'
+                                )
+                            ))
+        
+        equity_fig.update_layout(
+            title='Normalized Performance Comparison',
+            xaxis_title='Date',
+            yaxis_title='Value (Normalized to 100)',
+            legend=dict(
+                yanchor="top",
+                y=0.99,
+                xanchor="left",
+                x=0.01
+            ),
+            hovermode="x unified"
+        )
         
         # Compute drawdown: peak, then drawdown percentage.
         equity_df['peak'] = equity_df['value'].cummax()
@@ -218,9 +487,33 @@ class TradingDashboard:
         end_value = equity_df['value'].iloc[-1]
         total_return = (end_value - start_value) / start_value * 100
         max_drawdown = equity_df['drawdown'].max()
+        
+        # Calculate additional metrics based on benchmarks
+        benchmark_metrics = []
+        if selected_benchmarks and self.benchmark_data:
+            start_date = equity_df['date'].min() if not equity_df.empty else None
+            end_date = equity_df['date'].max() if not equity_df.empty else None
+            
+            for symbol in selected_benchmarks:
+                if symbol in self.benchmark_data:
+                    benchmark_df = self.benchmark_data[symbol]
+                    # Filter to the backtest date range
+                    if start_date and end_date:
+                        filtered_df = benchmark_df[(benchmark_df['Date'] >= start_date) & 
+                                                  (benchmark_df['Date'] <= end_date)]
+                        
+                        if not filtered_df.empty:
+                            # Calculate benchmark return
+                            b_start = filtered_df['Close'].iloc[0]
+                            b_end = filtered_df['Close'].iloc[-1]
+                            b_return = (b_end - b_start) / b_start * 100
+                            
+                            benchmark_metrics.append(html.P(f"{symbol} Return: {b_return:.2f}%"))
+        
         metrics_html = html.Div([
-            html.P(f"Total Return: {total_return:.2f}%"),
-            html.P(f"Max Drawdown: {max_drawdown:.2f}%")
+            html.P(f"Portfolio Total Return: {total_return:.2f}%"),
+            html.P(f"Max Drawdown: {max_drawdown:.2f}%"),
+            *benchmark_metrics
         ])
         
         # Build positions table.
@@ -256,6 +549,27 @@ class TradingDashboard:
         } for t in trades]
         
         return equity_fig, drawdown_fig, metrics_html, position_table, risk_fig, vol_display, trade_data
+
+    def _update_component_data(self):
+        """Update the component data after running a backtest"""
+        try:
+            # Check if engine exists and has backtest data
+            if not hasattr(self, 'engine') or not hasattr(self.engine, 'backtest_data'):
+                print("No engine or backtest data available")
+                return
+                
+            # Enable the timeline slider and reset its value to the last day
+            if 'history' in self.engine.backtest_data and self.engine.backtest_data['history']:
+                max_days = len(self.engine.backtest_data['history']) - 1
+                
+                # This doesn't directly update the UI, but sets up the data
+                # The UI will be updated by the interval component or when the user interacts
+                # with the slider
+                print(f"Updated component data with {max_days+1} days of backtest history")
+        except Exception as e:
+            print(f"Error in _update_component_data: {e}")
+            import traceback
+            traceback.print_exc()
 
     def create_synthetic_dashboard_data(self):
         """Create synthetic data for the dashboard if the backtest fails"""
