@@ -641,7 +641,7 @@ class TradingEngine:
         
         # Limit the number of days for faster testing
         max_days = min(len(handler.data[sym]) for sym in self.symbols)
-        max_days = min(max_days, 250)  # Limit to at most 250 days (~ 1 year of trading days)
+        max_days = min(max_days, 26)  # Limit to at most 60 days (~ 2 months of trading days)
         
         # Get dates from the first symbol's data
         first_symbol = self.symbols[0]
@@ -847,16 +847,16 @@ class TradingEngine:
         """Grid search to find weights maximizing Sharpe ratio"""
         best_sharpe = -np.inf
         best_weights = [1/len(strategy_signals)] * len(strategy_signals)  # Default equal weights
-        
+
         # Generate all possible weight combinations for two strategies
         if len(strategy_signals) == 2:
             closes = data['Close'].values
             returns = np.diff(closes) / closes[:-1] if len(closes) > 1 else []
             
-            for w1 in np.linspace(0, 1, 21):  # 0.0, 0.05, ..., 1.0
+            for w1 in np.linspace(0, 1, 3):  # 0.0, 0.05, ..., 1.0
                 w2 = 1 - w1
                 combined = []
-                for s1, s2 in zip(strategy_signals[0][:-1], strategy_signals[1][:-1]):
+                for s1, s2 in zip(strategy_signals[2][:-1], strategy_signals[3][:-1]):
                     combined.append(w1*s1 + w2*s2)
                 
                 if len(returns) == 0 or len(combined) == 0:
@@ -867,7 +867,7 @@ class TradingEngine:
                 
                 if sharpe > best_sharpe:
                     best_sharpe = sharpe
-                    best_weights = [w1, w2]
+                    best_weights = [0] * (len(strategy_signals) - 2) + [w1, w2]
         
         return best_weights
 
