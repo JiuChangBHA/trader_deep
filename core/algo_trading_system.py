@@ -103,15 +103,15 @@ class BacktestDataHandler(DataHandler):
         try:
             # Check if the data path exists
             if not os.path.exists(self.data_path):
-                logger.warning(f"Data path {self.data_path} does not exist.")
+                logger.error(f"Data path {self.data_path} does not exist.")
                 return self._generate_synthetic_data()
 
             # Assuming data is stored in CSV files named by symbol
             csv_files = [f for f in os.listdir(self.data_path) if f.endswith('.csv')]
             if not csv_files:
-                logger.warning(f"No CSV files found in {self.data_path}.")
+                logger.error(f"No CSV files found in {self.data_path}.")
                 return self._generate_synthetic_data()
-                
+            logger.info(f"Found {len(csv_files)} CSV files in {self.data_path}.")
             for file in csv_files:
                 if file.endswith('.csv'):
                     symbol = file.split('_')[0]
@@ -138,12 +138,6 @@ class BacktestDataHandler(DataHandler):
                         df['Close'] = np.random.randn(len(df)).cumsum() + 100
                     
                     data[symbol] = df
-            # If we didn't find any data for the symbols we need, create synthetic data
-            required_symbols = ['AAPL', 'MSFT']  # These should match the symbols in config
-            missing_symbols = [sym for sym in required_symbols if sym not in data.keys()]
-            
-            if missing_symbols:
-                logger.error(f"Missing data for symbols: {missing_symbols}.")
             
             return data
         except Exception as e:
@@ -1202,54 +1196,215 @@ class StrategyOptimizer:
         )
         
         return (symbol, strategy_name), study.best_params
-
+        
     def _objective(self, trial, symbol: str, strategy: TradingStrategy) -> float:
-        """Objective function for Optuna optimization - simplified for faster testing"""
-        # 1. Get historical data
-        data = self.engine.data_handler.data[symbol]
-        
-        # Use a smaller subset of data for faster testing
-        # if len(data) > 200:  # Only use a subset if we have enough data
-        #     data = data.iloc[-200:]
-        
-        # 2. Suggest parameters based on strategy type
-        params = self._suggest_parameters(trial, strategy)
-        
-        # 3. Configure walk-forward validation with fewer splits
-        tscv = TimeSeriesSplit(n_splits=3)  # Reduced from 5 splits
-        returns = []
-        
-        # 4. Walk-forward validation
-        for train_idx, test_idx in tscv.split(data):
+        """Enhanced objective function with robust validation and metrics"""
+        try:
+            # 1. Get relevant data (last 3 years for optimization)
+            full_data = self.engine.data_handler.data[symbol]
+            data = full_data.iloc[-750:] if len(full_data) > 750 else full_data
+            
+            # 2. Suggest parameters with adaptive ranges
+            params = self._suggest_adaptive_parameters(trial, strategy, data)
+            
+            # 3. Configure purged time series validation
+            tscv = PurgedTimeSeriesSplit(
+                n_splits=3,
+                purge_gap=5  # Prevent look-ahead bias
+            )
+            
+            # 4. Parallel evaluation of splits
+            results = Parallel(n_jobs=-1)(
+                delayed(self._evaluate_split)(data, train_idx, test_idx, strategy, params, trial)
+                for train_idx, test_idx in tscv.split(data)
+            )
+            
+            # 5. Aggregate results with robustness checks
+            valid_results = [r for r in results if r is not None]
+            if not valid_results:
+                return -np.inf  # All splits failed
+                
+            sharpe_ratios = [r['sharpe'] for r in valid_results]
+            drawdowns = [r['max_drawdown'] for r in valid_results]
+            returns = [r['returns'] for r in valid_results]
+            
+            # 6. Composite objective function
+            median_sharpe = np.nanmedian(sharpe_ratios)
+            median_drawdown = np.nanmedian(drawdowns)
+            median_return = np.nanmedian(returns)
+            
+            # Penalize high drawdowns and negative returns
+            objective_value = median_sharpe * (1 - median_drawdown) 
+            if median_return < 0:
+                objective_value *= 0.5
+                
+            # Report intermediate values for pruning
+            trial.report(objective_value, step=len(valid_results))
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+                
+            return objective_value
+            
+        except Exception as e:
+            logger.debug(f"Trial failed: {str(e)}")
+            return -np.inf
+
+    def _evaluate_split(self, data, train_idx, test_idx, strategy, params, trial):
+        """Evaluate a single split with enhanced metrics"""
+        try:
+            # Clone strategy with new parameters
+            temp_strategy = strategy.__class__(strategy.symbol, params)
+            
+            # Train/test split with purge gap
             train_data = data.iloc[train_idx]
             test_data = data.iloc[test_idx]
             
-            # Clone strategy with new parameters
-            temp_strategy = strategy.__class__(symbol, params)
+            # Simulate realistic execution with forward-looking prevention
+            signals = []
+            prices = []
+            for i in range(len(test_data)):
+                # Prevent look-ahead by using only data up to current point
+                available_data = pd.concat([train_data, test_data.iloc[:i]])
+                signal = temp_strategy.calculate_signal(available_data)
+                signals.append(self._signal_to_numeric(signal))
+                prices.append(test_data['Close'].iloc[i])
             
-            # Only evaluate on test data for speed
-            test_perf = self._backtest_strategy(temp_strategy, test_data)
-            returns.append(test_perf['sharpe'])
+            # Calculate returns with transaction costs (0.1% per trade)
+            returns = []
+            position = 0
+            prev_signal = 0
+            for i in range(1, len(signals)):
+                # Calculate price change
+                ret = (prices[i] - prices[i-1]) / prices[i-1]
+                
+                # Calculate position change
+                signal_change = signals[i-1] - prev_signal
+                transaction_cost = abs(signal_change) * 0.001  # 0.1% per trade
+                ret -= transaction_cost
+                
+                returns.append(signals[i-1] * ret)
+                prev_signal = signals[i-1]
             
-        return np.mean(returns)
+            # Calculate performance metrics
+            if len(returns) < 5 or np.std(returns) < 1e-6:
+                return None
+                
+            sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252)
+            cum_returns = np.cumprod([1 + r for r in returns])
+            max_drawdown = (np.maximum.accumulate(cum_returns) - cum_returns).max()
+            total_return = cum_returns[-1] - 1
+            
+            return {
+                'sharpe': sharpe,
+                'max_drawdown': max_drawdown,
+                'returns': total_return
+            }
+            
+        except Exception as e:
+            logger.debug(f"Split evaluation failed: {str(e)}")
+            return None
+
+    def _suggest_adaptive_parameters(self, trial, strategy: TradingStrategy, data: pd.DataFrame):
+        """Enhanced parameter suggestions with data-driven ranges"""
+        params = {}
+        
+        # Calculate volatility for adaptive parameter ranges
+        returns = data['Close'].pct_change().dropna()
+        volatility = returns.std() * np.sqrt(252)
+        
+        if isinstance(strategy, MeanReversionStrategy):
+            # Scale lookback with volatility (shorter windows for higher volatility)
+            base_lookback = max(10, min(50, int(30 / (volatility * 100 + 0.01))))
+            params['lookback'] = trial.suggest_int(
+                'lookback', 
+                base_lookback - 5, 
+                base_lookback + 5,
+                step=2
+            )
+            params['threshold'] = trial.suggest_float(
+                'threshold', 
+                max(1.0, 1.5 - volatility * 10),
+                min(3.0, 2.5 + volatility * 10),
+                step=0.1
+            )
+            
+        elif isinstance(strategy, BollingerBandsStrategy):
+            params['lookback'] = trial.suggest_int(
+                'lookback', 
+                10, 
+                50,
+                step=5
+            )
+            # Adjust number of std devs based on volatility
+            params['num_std'] = trial.suggest_float(
+                'num_std', 
+                max(1.5, 2.0 - volatility * 5),
+                min(2.5, 2.0 + volatility * 5),
+                step=0.1
+            )
+            
+        elif isinstance(strategy, MovingAverageCrossoverStrategy):
+            # Ensure short window < long window
+            short = trial.suggest_int('short_window', 5, 30, step=1)
+            params['long_window'] = trial.suggest_int(
+                'long_window', 
+                short + 10, 
+                max(short + 20, 100),
+                step=5
+            )
+            params['short_window'] = short
+            
+        elif isinstance(strategy, RSIStrategy):
+            params['period'] = trial.suggest_int(
+                'period', 
+                10, 
+                21,
+                step=2
+            )
+            # Dynamic overbought/oversold levels based on volatility
+            params['overbought'] = trial.suggest_int(
+                'overbought', 
+                65 + int(volatility * 500), 
+                75 + int(volatility * 500)
+            )
+            params['oversold'] = trial.suggest_int(
+                'oversold', 
+                25 - int(volatility * 500), 
+                35 - int(volatility * 500)
+            )
+            
+        return params
 
     def _suggest_parameters(self, trial, strategy: TradingStrategy):
         """Parameter space definition with narrower search spaces for faster optimization"""
         params = {}
         if isinstance(strategy, MeanReversionStrategy):
-            # Narrower parameter ranges
-            params['lookback'] = trial.suggest_int('lookback', 15, 25)  # Narrowed from 10-50
-            params['threshold'] = trial.suggest_float('threshold', 1.5, 2.5)  # Narrowed from 1.0-3.0
+            params['lookback'] = trial.suggest_int('lookback', 10, 50)  # Narrowed from 10-50
+            params['threshold'] = trial.suggest_float('threshold', 1.0, 3.0)  # Narrowed from 1.0-3.0
         elif isinstance(strategy, BollingerBandsStrategy):
-            params['lookback'] = trial.suggest_int('lookback', 15, 25)  # Narrowed from 10-50
-            params['num_std'] = trial.suggest_float('num_std', 1.8, 2.2)  # Narrowed from 1.5-2.5
+            params['lookback'] = trial.suggest_int('lookback', 10, 50)  # Narrowed from 10-50
+            params['num_std'] = trial.suggest_float('num_std', 1.5, 2.5)  # Narrowed from 1.5-2.5
         elif isinstance(strategy, MovingAverageCrossoverStrategy):
-            params['short_window'] = trial.suggest_int('short_window', 8, 15)  # Narrowed from 5-20
-            params['long_window'] = trial.suggest_int('long_window', 40, 70)  # Narrowed from 30-100
+            params['short_window'] = trial.suggest_int('short_window', 5, 20)  # Narrowed from 5-20
+            params['long_window'] = trial.suggest_int('long_window', 30, 100)  # Narrowed from 30-100
         elif isinstance(strategy, RSIStrategy):
-            params['period'] = trial.suggest_int('period', 12, 18)  # Narrowed from 10-21
-            params['overbought'] = trial.suggest_int('overbought', 68, 72)  # Narrowed from 65-75
-            params['oversold'] = trial.suggest_int('oversold', 28, 32)  # Narrowed from 25-35
+            params['period'] = trial.suggest_int('period', 10, 21)  # Narrowed from 10-21
+            params['overbought'] = trial.suggest_int('overbought', 65, 75)  # Narrowed from 65-75
+            params['oversold'] = trial.suggest_int('oversold', 25, 35)  # Narrowed from 25-35
+        # if isinstance(strategy, MeanReversionStrategy):
+        #     # Narrower parameter ranges
+        #     params['lookback'] = trial.suggest_int('lookback', 15, 25)  # Narrowed from 10-50
+        #     params['threshold'] = trial.suggest_float('threshold', 1.5, 2.5)  # Narrowed from 1.0-3.0
+        # elif isinstance(strategy, BollingerBandsStrategy):
+        #     params['lookback'] = trial.suggest_int('lookback', 15, 25)  # Narrowed from 10-50
+        #     params['num_std'] = trial.suggest_float('num_std', 1.8, 2.2)  # Narrowed from 1.5-2.5
+        # elif isinstance(strategy, MovingAverageCrossoverStrategy):
+        #     params['short_window'] = trial.suggest_int('short_window', 8, 15)  # Narrowed from 5-20
+        #     params['long_window'] = trial.suggest_int('long_window', 40, 70)  # Narrowed from 30-100
+        # elif isinstance(strategy, RSIStrategy):
+        #     params['period'] = trial.suggest_int('period', 12, 18)  # Narrowed from 10-21
+        #     params['overbought'] = trial.suggest_int('overbought', 68, 72)  # Narrowed from 65-75
+        #     params['oversold'] = trial.suggest_int('oversold', 28, 32)  # Narrowed from 25-35
         return params
 
     def _backtest_strategy(self, strategy: TradingStrategy, data: pd.DataFrame) -> dict:
@@ -1359,17 +1514,18 @@ config = {
     'api_key': 'AKGJL44ZUAB56704LFVX',
     'secret_key': 'mPWPeY6T2TfyiAv7ebrFDejhFa0yhH1Xlj57v0lb',
     'data_path': 'C:/Users/jchang427/OneDrive - Georgia Institute of Technology/Random Projects/trading_sim_cursor/src/main/resources/market_data/2025-03-10-07-28_market_data_export_2020-03-11_to_2025-03-10',  # Simplified path that will use synthetic data
+    # 'data_path': 'C:/Users/jchang427/OneDrive - Georgia Institute of Technology/Random Projects/trading_sim_cursor/src/main/resources/market_data/subset',  # Simplified path that will use synthetic data
     'initial_equity': 100000,
     'walk_forward': {
-        'optimization_window_days': 90,  # Reduced from 180 days to 90 days
-        'out_of_sample_window_days': 60   # Increased from 21 to 60 for less frequent optimization
+        'optimization_window_days': 180,  # Reduced from 180 days to 90 days
+        'out_of_sample_window_days': 21   # Increased from 21 to 60 for less frequent optimization
     },
     'mvo_enabled': False,  # Keep MVO disabled for speed
-    'rebalance_frequency': 60,  # Reduced rebalancing frequency (less computation)
-    'mvo_lookback': 126,        # Reduced from 252 to 126 (6 months instead of 1 year)
-    'max_backtest_days': 120,
+    'rebalance_frequency': 120,  # Reduced rebalancing frequency (less computation)
+    'mvo_lookback': 250,        # Reduced from 252 to 126 (6 months instead of 1 year)
+    'max_backtest_days': 250,
     'optimization': {
-        'n_trials': 5,  # Reduced from 20
+        'n_trials': 100,  # Reduced from 20
         'cache_ttl_days': 30,  # Increased from 7
     }
 }

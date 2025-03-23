@@ -47,11 +47,8 @@ def update_config_with_optimized_params(config, optimized_data, strategy_toggle=
             # Strip parentheses and split by comma
             parts = param_key.strip("()").split(", ")
             if len(parts) == 2:
-                symbol, strategy_name = parts
-                
-                # Remove quotes if present
-                symbol = symbol.strip("'")
-                strategy_name = strategy_name.strip("'")
+                symbol = parts[0].strip("'\" ")  # Handle any quotes/whitespace
+                strategy_name = parts[1].strip("'\" ")
                 
                 # Map class names to strategy config names
                 strategy_name_map = {
@@ -144,7 +141,7 @@ class TradingDashboard:
                                 {'label': 'All Strategies', 'value': 'all'},
                                 {'label': 'Mean Reversion & Bollinger Bands Only', 'value': 'mb_only'}
                             ],
-                            value='mb_only',
+                            value='all',
                             labelStyle={'display': 'block'}
                         ),
                         html.Button(
